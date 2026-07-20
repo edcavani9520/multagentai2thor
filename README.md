@@ -1,49 +1,33 @@
-# LaMMA-P Multi-Agent AI2-THOR Framework
+# multagentai2thor
 
-基于 AI2-THOR 的多智能体框架，支持异构机器人任务分配与协同。
+当前主线是“EmbodiedGPT relay 闭环任务服务 + 原生 AI2-THOR 多 robot receiver”。
 
+```text
+client / coordinator -> relay_task_server.py -> ai2thor_receiver_server.py -> AI2-THOR
 ```
-python run.py --show --keep-open
-```
 
-## 快速开始
+## 启动
+
+先启动共享场景 receiver：
 
 ```bash
-pip install ai2thor
-cd ~/lamma-p-framework
-
-# 基本运行
-python3 run.py
-
-# 看两个 robot 视角
-python3 run.py --show
-
-# 完整功能
-python3 run.py --no-headless --show --keep-open --steps 20
+python ai2thor_receiver_server.py \
+  --scene FloorPlan1 --robots 2 --port 19000 --no-show
 ```
 
-## 文档
+再启动 relay 闭环任务服务：
 
-详细教程：[TUTORIAL.md](./TUTORIAL.md)
-
-涵盖：
-- 架构与运行逻辑
-- 所有 CLI 参数
-- Agent 接口定义
-- 接入真实 Agent 的方法
-- GUI 模式与窗口管理
-- FAQ / 踩坑记录
-
-## 项目结构
-
+```bash
+bash run_relay_task_server.sh \
+  --model-path models/Qwen3.5-4B \
+  --receiver-url http://127.0.0.1:19000 \
+  --port 18080 --device cuda --dtype float16
 ```
-├── run.py                 # 入口
-├── multi_agent_env.py     # 核心协调器
-├── agents/
-│   ├── base_agent.py      # Agent 接口
-│   ├── dummy_agent.py     # 占位 agent
-│   └── colleague_agent_stub.py  # 接入模板
-├── output/                # 截图 + 日志
-├── TUTORIAL.md            # 完整教程
-└── README.md
-```
+
+任务 API 见 [RELAY_TASK_SERVICE.md](RELAY_TASK_SERVICE.md)，relay 闭环设计见 [relay_closed_loop_design_cn.md](relay_closed_loop_design_cn.md)。AI2-THOR HTTP 接口和项目架构见 [PROJECT_ARCHITECTURE_DRAFT.md](PROJECT_ARCHITECTURE_DRAFT.md)。
+
+## 文件状态
+
+完整文件分层与保留状态见 [PROJECT_FILE_MAP.md](PROJECT_FILE_MAP.md)。
+
+当前仓库已移除单步 `qwen_action_service.py`、本地 Qwen loop、早期 `MultiAgentEnv`、custom agent 和 OpenVLA 实验代码，只保留 Qwen3.5-4B 的 relay 闭环路线。

@@ -1,4 +1,1 @@
-"""
-Agent modules for the multi-agent framework.
-Each agent implements: function(observation) -> action
-"""
+"""Model adapters used by the current AI2-THOR service pipeline."""

@@ -26,6 +26,7 @@ venv/
 *.ckpt
 *.bin
 *.onnx
+*.safetensors
 
 # AI2-THOR 下载缓存
 .ai2thor/

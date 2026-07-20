@@ -1,0 +1,6 @@
+torch
+torchvision
+accelerate
+pillow
+qwen-vl-utils
+transformers @ git+https://github.com/huggingface/transformers.git@main

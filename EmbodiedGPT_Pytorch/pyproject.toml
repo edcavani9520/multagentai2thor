@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robohusky"
+version = "0.1.0"
+description = "Qwen3.5 multimodal embodied planning and AI2-THOR integration."
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+]
+dependencies = [
+    "accelerate", "numpy", "pillow", "qwen-vl-utils", "requests",
+    "torch>=2.0", "torchvision>=0.15.2",
+    "transformers @ git+https://github.com/huggingface/transformers.git@main",
+]
+
+[project.optional-dependencies]
+legacy-training = ["datasets", "decord", "peft", "deepspeed"]
+dev = ["black>=23.3.0", "pylint>=2.8.2"]
+
+[project.urls]
+Homepage = "https://github.com/EmbodiedGPT/EmbodiedGPT_Pytorch"
+"Bug Tracker" = "https://github.com/EmbodiedGPT/EmbodiedGPT_Pytorch/issues"
+
+[tool.setuptools.packages.find]
+exclude = ["assets*", "benchmark*", "docs", "dist*", "playground*", "scripts*", "tests*"]
+
+[tool.wheel]
+exclude = ["assets*", "benchmark*", "docs", "dist*", "playground*", "scripts*", "tests*"]

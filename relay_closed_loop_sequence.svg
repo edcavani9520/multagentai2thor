@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1320" viewBox="0 0 1800 1320">
+  <defs>
+    <style>
+      .title { font: 700 32px "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif; fill: #111827; }
+      .lane-title { font: 700 16px "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif; fill: #111827; }
+      .label { font: 15px "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif; fill: #111827; }
+      .small { font: 13px "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif; fill: #374151; }
+      .note { font: 14px "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif; fill: #1f2937; }
+      .lane { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.2; }
+      .lifeline { stroke: #94a3b8; stroke-width: 1.4; stroke-dasharray: 8 7; }
+      .msg { stroke: #2563eb; stroke-width: 2.2; fill: none; marker-end: url(#arrow-blue); }
+      .return { stroke: #64748b; stroke-width: 2; fill: none; stroke-dasharray: 8 5; marker-end: url(#arrow-gray); }
+      .branch { fill: #fff7ed; stroke: #fb923c; stroke-width: 1.4; rx: 12; }
+      .loop { fill: none; stroke: #475569; stroke-width: 1.8; rx: 14; stroke-dasharray: 10 6; }
+      .success { fill: #ecfdf5; stroke: #10b981; stroke-width: 1.4; rx: 10; }
+      .failure { fill: #fef2f2; stroke: #ef4444; stroke-width: 1.4; rx: 10; }
+      .module { fill: #eef2ff; stroke: #6366f1; stroke-width: 1.4; rx: 10; }
+    </style>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-gray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1800" height="1320" fill="#ffffff"/>
+  <text x="900" y="54" text-anchor="middle" class="title">基于中转智能体的多机器人闭环任务重规划时序</text>
+
+  <g id="lanes">
+    <rect class="lane" x="40" y="88" width="170" height="1160"/>
+    <rect class="lane" x="230" y="88" width="180" height="1160"/>
+    <rect class="lane" x="430" y="88" width="180" height="1160"/>
+    <rect class="lane" x="630" y="88" width="210" height="1160"/>
+    <rect class="lane" x="860" y="88" width="210" height="1160"/>
+    <rect class="lane" x="1090" y="88" width="180" height="1160"/>
+    <rect class="lane" x="1290" y="88" width="180" height="1160"/>
+    <rect class="lane" x="1490" y="88" width="270" height="1160"/>
+  </g>
+
+  <text x="125" y="128" text-anchor="middle" class="lane-title">用户/CLI</text>
+  <text x="320" y="128" text-anchor="middle" class="lane-title">Primary Probe</text>
+  <text x="520" y="128" text-anchor="middle" class="lane-title">意图解析器</text>
+  <text x="735" y="128" text-anchor="middle" class="lane-title">闭环控制器</text>
+  <text x="965" y="120" text-anchor="middle" class="lane-title">Primary Fast Path</text>
+  <text x="965" y="140" text-anchor="middle" class="lane-title">硬验证器</text>
+  <text x="1180" y="128" text-anchor="middle" class="lane-title">中转 Agent</text>
+  <text x="1380" y="128" text-anchor="middle" class="lane-title">证据工具</text>
+  <text x="1625" y="120" text-anchor="middle" class="lane-title">Executor 语义规划器</text>
+  <text x="1625" y="140" text-anchor="middle" class="lane-title">与 execute_actions</text>
+
+  <line class="lifeline" x1="125" y1="155" x2="125" y2="1230"/>
+  <line class="lifeline" x1="320" y1="155" x2="320" y2="1230"/>
+  <line class="lifeline" x1="520" y1="155" x2="520" y2="1230"/>
+  <line class="lifeline" x1="735" y1="155" x2="735" y2="1230"/>
+  <line class="lifeline" x1="965" y1="155" x2="965" y2="1230"/>
+  <line class="lifeline" x1="1180" y1="155" x2="1180" y2="1230"/>
+  <line class="lifeline" x1="1380" y1="155" x2="1380" y2="1230"/>
+  <line class="lifeline" x1="1625" y1="155" x2="1625" y2="1230"/>
+
+  <line class="msg" x1="125" y1="185" x2="320" y2="185"/>
+  <text x="222" y="174" text-anchor="middle" class="label">提交 task 与 primary_robot_id</text>
+
+  <line class="msg" x1="320" y1="225" x2="1625" y2="225"/>
+  <text x="972" y="214" text-anchor="middle" class="label">probe primary 视角</text>
+  <line class="return" x1="1625" y1="265" x2="320" y2="265"/>
+  <text x="972" y="254" text-anchor="middle" class="label">primary observation：objects / image / robot state</text>
+
+  <line class="msg" x1="320" y1="305" x2="520" y2="305"/>
+  <text x="420" y="294" text-anchor="middle" class="label">args.task + 可用物体类别</text>
+  <line class="return" x1="520" y1="345" x2="735" y2="345"/>
+  <text x="628" y="334" text-anchor="middle" class="label">task_intent</text>
+
+  <rect class="loop" x="610" y="375" width="1050" height="740"/>
+  <text x="632" y="402" class="lane-title">loop：对每个 intent step 执行闭环重规划</text>
+
+  <rect class="module" x="650" y="430" width="170" height="62"/>
+  <text x="735" y="455" text-anchor="middle" class="label">构造 step_task</text>
+  <text x="735" y="476" text-anchor="middle" class="small">step_intent / step_plan_hint</text>
+
+  <rect class="module" x="650" y="520" width="170" height="58"/>
+  <text x="735" y="545" text-anchor="middle" class="label">already-satisfied</text>
+  <text x="735" y="565" text-anchor="middle" class="small">已满足则跳过步骤</text>
+
+  <line class="msg" x1="735" y1="615" x2="965" y2="615"/>
+  <text x="850" y="604" text-anchor="middle" class="label">验证 primary 是否可执行</text>
+
+  <rect class="branch" x="880" y="645" width="310" height="132"/>
+  <text x="1035" y="672" text-anchor="middle" class="lane-title">分支 A：primary 可执行</text>
+  <line class="return" x1="965" y1="705" x2="735" y2="705"/>
+  <text x="850" y="694" text-anchor="middle" class="label">primary_fast_path</text>
+  <text x="1035" y="742" text-anchor="middle" class="note">跳过中转 Agent，executor = primary</text>
+
+  <rect class="branch" x="865" y="805" width="690" height="190"/>
+  <text x="1210" y="832" text-anchor="middle" class="lane-title">分支 B：primary 不可执行</text>
+  <line class="return" x1="965" y1="865" x2="735" y2="865"/>
+  <text x="850" y="854" text-anchor="middle" class="label">primary_inability_reason</text>
+  <line class="msg" x1="735" y1="900" x2="1180" y2="900"/>
+  <text x="958" y="889" text-anchor="middle" class="label">route_with_relay_agent</text>
+  <line class="msg" x1="1180" y1="935" x2="1380" y2="935"/>
+  <text x="1280" y="924" text-anchor="middle" class="label">查询/评估/观察</text>
+  <line class="return" x1="1380" y1="970" x2="1180" y2="970"/>
+  <text x="1280" y="959" text-anchor="middle" class="label">candidate scores + observations</text>
+
+  <rect class="success" x="1115" y="1025" width="230" height="60"/>
+  <text x="1230" y="1050" text-anchor="middle" class="label">select_executor</text>
+  <text x="1230" y="1070" text-anchor="middle" class="small">通过硬验证后返回 executor</text>
+
+  <rect class="failure" x="1365" y="1025" width="170" height="60"/>
+  <text x="1450" y="1050" text-anchor="middle" class="label">report_failure</text>
+  <text x="1450" y="1070" text-anchor="middle" class="small">needs_upstream_planning</text>
+
+  <line class="msg" x1="735" y1="1145" x2="1625" y2="1145"/>
+  <text x="1180" y="1134" text-anchor="middle" class="label">executor image + objects + step_intent</text>
+  <line class="return" x1="1625" y1="1185" x2="735" y2="1185"/>
+  <text x="1180" y="1174" text-anchor="middle" class="label">step_semantic_plan</text>
+
+  <rect class="module" x="650" y="1210" width="170" height="54"/>
+  <text x="735" y="1233" text-anchor="middle" class="label">验证 + grounding</text>
+  <text x="735" y="1252" text-anchor="middle" class="small">objectType → objectId</text>
+
+  <line class="msg" x1="735" y1="1285" x2="1625" y2="1285"/>
+  <text x="1180" y="1274" text-anchor="middle" class="label">payload_for_actions，stop_on_failure=false</text>
+
+  <rect class="success" x="1435" y="1210" width="240" height="58"/>
+  <text x="1555" y="1234" text-anchor="middle" class="label">执行成功</text>
+  <text x="1555" y="1254" text-anchor="middle" class="small">合并 observation / held / inventory</text>
+
+  <rect class="failure" x="1435" y="1128" width="240" height="52"/>
+  <text x="1555" y="1150" text-anchor="middle" class="label">执行失败</text>
+  <text x="1555" y="1168" text-anchor="middle" class="small">返回 failed_step + reason</text>
+
+  <text x="60" y="1295" class="small">注：step_plan_hint 仅用于路由与验证，不是视觉模型生成的 step_semantic_plan；candidate evaluator 只提供候选证据，最终选择由中转 Agent 提交并经硬验证。</text>
+</svg>
