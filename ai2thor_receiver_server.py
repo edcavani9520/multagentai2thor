@@ -47,6 +47,7 @@ DEFAULT_AGENT_Y = 0.900999128818512
 DEFAULT_GRID_SIZE = 0.25
 DEFAULT_GRID_EPSILON = 0.03
 DEFAULT_ROTATE_STEP_DEGREES = 90.0
+DEFAULT_YAW_TOLERANCE_DEGREES = 1e-3
 DEFAULT_OBJECT_MIN_DISTANCE = 0.75
 
 
@@ -197,19 +198,27 @@ def path_to_actions(
     *,
     current_yaw: float,
     rotate_step_degrees: float = DEFAULT_ROTATE_STEP_DEGREES,
-) -> list[dict[str, str]]:
+    yaw_tolerance_degrees: float = DEFAULT_YAW_TOLERANCE_DEGREES,
+) -> list[dict[str, Any]]:
     if rotate_step_degrees <= 0:
         raise NavigationPlanningError("invalid_target", "rotate_step_degrees must be positive")
-    actions: list[dict[str, str]] = []
+    if yaw_tolerance_degrees < 0:
+        raise NavigationPlanningError("invalid_target", "yaw_tolerance_degrees must be non-negative")
+    actions: list[dict[str, Any]] = []
     yaw = float(current_yaw) % 360.0
     for current, next_position in zip(path, path[1:]):
         target_yaw = _yaw_for_step(current, next_position)
         delta = signed_angle_delta(target_yaw, yaw)
-        turns = int(round(abs(delta) / rotate_step_degrees))
-        if turns:
+        abs_delta = abs(delta)
+        if abs_delta > yaw_tolerance_degrees:
             turn_action = "RotateRight" if delta > 0 else "RotateLeft"
-            actions.extend({"action": turn_action} for _ in range(turns))
-            yaw = (yaw + (turns * rotate_step_degrees if delta > 0 else -turns * rotate_step_degrees)) % 360.0
+            turns = int(round(abs_delta / rotate_step_degrees))
+            snapped_degrees = turns * rotate_step_degrees
+            if turns > 0 and abs(abs_delta - snapped_degrees) <= yaw_tolerance_degrees:
+                actions.extend({"action": turn_action} for _ in range(turns))
+            else:
+                actions.append({"action": turn_action, "degrees": abs_delta})
+            yaw = target_yaw
         actions.append({"action": "MoveAhead"})
     return actions
 

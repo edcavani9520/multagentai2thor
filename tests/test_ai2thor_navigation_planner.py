@@ -69,6 +69,20 @@ class NavigationPlannerPureFunctionTest(unittest.TestCase):
             ],
         )
 
+    def test_path_to_actions_corrects_non_grid_initial_yaw(self) -> None:
+        actions = path_to_actions(
+            [
+                {"x": 0.0, "y": 0.9, "z": 0.0},
+                {"x": 0.0, "y": 0.9, "z": 0.25},
+            ],
+            current_yaw=41.1859,
+            rotate_step_degrees=90.0,
+        )
+
+        self.assertEqual(actions[0]["action"], "RotateLeft")
+        self.assertAlmostEqual(actions[0]["degrees"], 41.1859)
+        self.assertEqual(actions[1], {"action": "MoveAhead"})
+
     def test_choose_reachable_goal_uses_standing_point_not_object_center(self) -> None:
         reachable = [
             {"x": 0.0, "y": 0.9, "z": 0.0},
@@ -87,14 +101,14 @@ class NavigationPlannerPureFunctionTest(unittest.TestCase):
 
 
 class NavigationReceiverMethodTest(unittest.TestCase):
-    def fake_server(self) -> NativeControllerThorServer:
+    def fake_server(self, *, yaw: float = 0.0) -> NativeControllerThorServer:
         server = NativeControllerThorServer.__new__(NativeControllerThorServer)
         server.robots = [
             RobotState(
                 robot_id=0,
                 name="Robot0",
                 position={"x": 0.0, "y": 0.9, "z": 0.0},
-                rotation={"x": 0.0, "y": 0.0, "z": 0.0},
+                rotation={"x": 0.0, "y": yaw, "z": 0.0},
             )
         ]
         return server
@@ -129,6 +143,25 @@ class NavigationReceiverMethodTest(unittest.TestCase):
         self.assertFalse(result["execute"])
         self.assertEqual(result["actions"], [{"action": "RotateRight"}, {"action": "MoveAhead"}])
         self.assertNotIn("execute_result", result)
+
+    def test_goto_dry_run_corrects_non_grid_initial_yaw(self) -> None:
+        server = self.fake_server(yaw=41.1859)
+        server.capture_state = MethodType(lambda self, robot_ref=None, render_image=False: {"objects": []}, server)
+        server._get_reachable_positions = MethodType(
+            lambda self, robot_ref=None: [
+                {"x": 0.0, "y": 0.9, "z": 0.0},
+                {"x": 0.0, "y": 0.9, "z": 0.25},
+            ],
+            server,
+        )
+        server.execute_batch = MethodType(lambda *args, **kwargs: self.fail("dry-run /goto must not execute"), server)
+
+        result = server.goto({"task_id": "goto-1", "robot_id": 0, "target_position": {"x": 0.0, "z": 0.25}})
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["actions"][0]["action"], "RotateLeft")
+        self.assertAlmostEqual(result["actions"][0]["degrees"], 41.1859)
+        self.assertEqual(result["actions"][1], {"action": "MoveAhead"})
 
     def test_goto_execute_calls_execute_batch_with_stop_on_failure_true(self) -> None:
         server = self.fake_server()
