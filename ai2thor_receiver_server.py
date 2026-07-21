@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import heapq
 import json
 import math
 import sys
@@ -26,15 +27,226 @@ import traceback
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
-from ai2thor.controller import Controller
-from ai2thor.platform import CloudRendering
-from ai2thor.server import MultiAgentEvent
+try:
+    from ai2thor.controller import Controller
+    from ai2thor.platform import CloudRendering
+    from ai2thor.server import MultiAgentEvent
+except ModuleNotFoundError:
+    Controller = None
+    CloudRendering = None
+
+    class MultiAgentEvent:  # type: ignore[no-redef]
+        pass
 
 
 DEFAULT_AGENT_Y = 0.900999128818512
+
+DEFAULT_GRID_SIZE = 0.25
+DEFAULT_GRID_EPSILON = 0.03
+DEFAULT_ROTATE_STEP_DEGREES = 90.0
+DEFAULT_OBJECT_MIN_DISTANCE = 0.75
+
+
+class NavigationPlanningError(ValueError):
+    def __init__(self, error_code: str, message: str):
+        super().__init__(message)
+        self.error_code = error_code
+
+
+def _position_dict(value: Any, *, field: str = "position") -> dict[str, float]:
+    if not isinstance(value, dict):
+        raise NavigationPlanningError("invalid_target", f"{field} must be an object with x/y/z")
+    if "x" not in value or "z" not in value:
+        raise NavigationPlanningError("invalid_target", f"{field} must contain x and z")
+    try:
+        return {
+            "x": float(value["x"]),
+            "y": float(value.get("y", DEFAULT_AGENT_Y)),
+            "z": float(value["z"]),
+        }
+    except (TypeError, ValueError) as exc:
+        raise NavigationPlanningError("invalid_target", f"{field} coordinates must be numeric") from exc
+
+
+def _node_for_position(position: dict[str, Any], precision: int = 3) -> tuple[float, float]:
+    return (round(float(position["x"]), precision), round(float(position["z"]), precision))
+
+
+def _distance_xz(a: dict[str, Any], b: dict[str, Any]) -> float:
+    dx = float(a["x"]) - float(b["x"])
+    dz = float(a["z"]) - float(b["z"])
+    return math.sqrt(dx * dx + dz * dz)
+
+
+def find_nearest_position(positions: list[dict[str, Any]], target: dict[str, Any]) -> dict[str, float] | None:
+    if not positions:
+        return None
+    return dict(min(positions, key=lambda pos: _distance_xz(pos, target)))
+
+
+def choose_reachable_goal(
+    reachable: list[dict[str, Any]],
+    target: dict[str, Any],
+    *,
+    min_distance: float = 0.0,
+    max_distance: float | None = None,
+) -> dict[str, float] | None:
+    candidates: list[dict[str, Any]] = []
+    for position in reachable:
+        try:
+            distance = _distance_xz(position, target)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if distance < min_distance:
+            continue
+        if max_distance is not None and distance > max_distance:
+            continue
+        candidates.append(position)
+    if not candidates:
+        return None
+    return dict(min(candidates, key=lambda pos: _distance_xz(pos, target)))
+
+
+def build_reachable_graph(
+    positions: list[dict[str, Any]],
+    *,
+    grid_size: float = DEFAULT_GRID_SIZE,
+    epsilon: float = DEFAULT_GRID_EPSILON,
+) -> tuple[dict[tuple[float, float], list[tuple[tuple[float, float], float]]], dict[tuple[float, float], dict[str, float]]]:
+    node_positions: dict[tuple[float, float], dict[str, float]] = {}
+    for position in positions:
+        try:
+            clean = _position_dict(position)
+        except NavigationPlanningError:
+            continue
+        node_positions[_node_for_position(clean)] = clean
+
+    graph: dict[tuple[float, float], list[tuple[tuple[float, float], float]]] = {
+        node: [] for node in node_positions
+    }
+    nodes = list(node_positions)
+    for index, node in enumerate(nodes):
+        pos = node_positions[node]
+        for other in nodes[index + 1:]:
+            other_pos = node_positions[other]
+            dx = abs(pos["x"] - other_pos["x"])
+            dz = abs(pos["z"] - other_pos["z"])
+            horizontal_neighbor = dx <= grid_size + epsilon and dz <= epsilon and dx > epsilon
+            vertical_neighbor = dz <= grid_size + epsilon and dx <= epsilon and dz > epsilon
+            if not (horizontal_neighbor or vertical_neighbor):
+                continue
+            cost = _distance_xz(pos, other_pos)
+            graph[node].append((other, cost))
+            graph[other].append((node, cost))
+    return graph, node_positions
+
+
+def astar_path(
+    graph: dict[tuple[float, float], list[tuple[tuple[float, float], float]]],
+    start: tuple[float, float],
+    goal: tuple[float, float],
+) -> list[tuple[float, float]] | None:
+    if start not in graph or goal not in graph:
+        return None
+    open_heap: list[tuple[float, tuple[float, float]]] = [(0.0, start)]
+    came_from: dict[tuple[float, float], tuple[float, float]] = {}
+    g_score: dict[tuple[float, float], float] = {start: 0.0}
+    closed: set[tuple[float, float]] = set()
+
+    def heuristic(node: tuple[float, float]) -> float:
+        return math.sqrt((node[0] - goal[0]) ** 2 + (node[1] - goal[1]) ** 2)
+
+    while open_heap:
+        _, current = heapq.heappop(open_heap)
+        if current in closed:
+            continue
+        if current == goal:
+            path = [current]
+            while current in came_from:
+                current = came_from[current]
+                path.append(current)
+            return list(reversed(path))
+        closed.add(current)
+        for neighbor, edge_cost in graph.get(current, []):
+            tentative = g_score[current] + edge_cost
+            if tentative >= g_score.get(neighbor, float("inf")):
+                continue
+            came_from[neighbor] = current
+            g_score[neighbor] = tentative
+            heapq.heappush(open_heap, (tentative + heuristic(neighbor), neighbor))
+    return None
+
+
+def signed_angle_delta(target_yaw: float, current_yaw: float) -> float:
+    return (target_yaw - current_yaw + 180.0) % 360.0 - 180.0
+
+
+def _yaw_for_step(current: dict[str, Any], next_position: dict[str, Any]) -> float:
+    dx = float(next_position["x"]) - float(current["x"])
+    dz = float(next_position["z"]) - float(current["z"])
+    if abs(dx) < 1e-6 and abs(dz) < 1e-6:
+        return 0.0
+    return math.degrees(math.atan2(dx, dz)) % 360.0
+
+
+def path_to_actions(
+    path: list[dict[str, Any]],
+    *,
+    current_yaw: float,
+    rotate_step_degrees: float = DEFAULT_ROTATE_STEP_DEGREES,
+) -> list[dict[str, str]]:
+    if rotate_step_degrees <= 0:
+        raise NavigationPlanningError("invalid_target", "rotate_step_degrees must be positive")
+    actions: list[dict[str, str]] = []
+    yaw = float(current_yaw) % 360.0
+    for current, next_position in zip(path, path[1:]):
+        target_yaw = _yaw_for_step(current, next_position)
+        delta = signed_angle_delta(target_yaw, yaw)
+        turns = int(round(abs(delta) / rotate_step_degrees))
+        if turns:
+            turn_action = "RotateRight" if delta > 0 else "RotateLeft"
+            actions.extend({"action": turn_action} for _ in range(turns))
+            yaw = (yaw + (turns * rotate_step_degrees if delta > 0 else -turns * rotate_step_degrees)) % 360.0
+        actions.append({"action": "MoveAhead"})
+    return actions
+
+
+def find_object_target(payload: dict[str, Any], state: dict[str, Any], robot_position: dict[str, Any]) -> tuple[dict[str, float], dict[str, Any]]:
+    if "target_position" in payload:
+        target = _position_dict(payload.get("target_position"), field="target_position")
+        return target, {"kind": "position", "position": target}
+
+    objects = state.get("objects", []) if isinstance(state, dict) else []
+    if not isinstance(objects, list):
+        objects = []
+    object_id = payload.get("object_id") or payload.get("objectId")
+    object_type = payload.get("object_type") or payload.get("objectType")
+    matches: list[dict[str, Any]] = []
+    if isinstance(object_id, str) and object_id.strip():
+        matches = [obj for obj in objects if obj.get("id") == object_id or obj.get("objectId") == object_id]
+    elif isinstance(object_type, str) and object_type.strip():
+        normalized = object_type.lower()
+        matches = [obj for obj in objects if str(obj.get("type") or obj.get("objectType") or "").lower() == normalized]
+    else:
+        raise NavigationPlanningError("invalid_target", "provide target_position, object_id, or object_type")
+
+    positioned = [obj for obj in matches if isinstance(obj.get("position"), dict)]
+    if not positioned:
+        raise NavigationPlanningError("target_not_found", "target object was not found with a usable position")
+    selected = min(positioned, key=lambda obj: _distance_xz(obj["position"], robot_position))
+    target = _position_dict(selected["position"], field="object.position")
+    return target, {
+        "kind": "object",
+        "object_id": selected.get("id") or selected.get("objectId"),
+        "object_type": selected.get("type") or selected.get("objectType"),
+        "position": target,
+        "visible": selected.get("visible"),
+        "distance": selected.get("distance"),
+    }
+
 _CV2 = None
 _CV2_IMPORT_ERROR = None
 
@@ -147,6 +359,8 @@ class NativeControllerThorServer:
             "SIM IN",
             f"Start standard Controller(scene={self.scene}, robots={self.robot_count}, headless={self.headless})",
         )
+        if Controller is None:
+            raise RuntimeError("ai2thor is not installed; install ai2thor to start the receiver server")
         self.controller = Controller(**kwargs)
         self._validate_agent_count(self.controller.last_event)
         self._setup_robots()
@@ -571,6 +785,109 @@ class NativeControllerThorServer:
                 }
         return None
 
+    def reachable_positions_response(self, robot_ref=None) -> dict:
+        robot = self.resolve_robot(robot_ref)
+        positions = self._get_reachable_positions(robot.robot_id)
+        return {"status": "success", "robot_id": robot.robot_id, "positions": positions}
+
+    def plan_goto(self, payload: dict) -> dict:
+        if not isinstance(payload, dict):
+            raise NavigationPlanningError("invalid_target", "payload must be an object")
+        robot_ref = payload.get("robot_id", payload.get("robot", payload.get("agent_id")))
+        robot = self.resolve_robot(robot_ref)
+        state = self.capture_state(robot.robot_id, render_image=False)
+        robot_position = _position_dict(robot.position, field="robot.position")
+        target_position, target = find_object_target(payload, state, robot_position)
+        reachable = self._get_reachable_positions(robot.robot_id)
+        if not reachable:
+            raise NavigationPlanningError("no_reachable_positions", "GetReachablePositions returned no usable positions")
+
+        has_object_target = target.get("kind") == "object"
+        min_distance = payload.get("min_distance", DEFAULT_OBJECT_MIN_DISTANCE if has_object_target else 0.0)
+        max_distance = payload.get("max_distance")
+        grid_size = float(payload.get("grid_size", DEFAULT_GRID_SIZE))
+        epsilon = float(payload.get("grid_epsilon", DEFAULT_GRID_EPSILON))
+        rotate_step = float(payload.get("rotate_step_degrees", DEFAULT_ROTATE_STEP_DEGREES))
+        max_actions = payload.get("max_actions")
+        try:
+            min_distance = float(min_distance)
+            max_distance = float(max_distance) if max_distance is not None else None
+            max_actions = int(max_actions) if max_actions is not None else None
+        except (TypeError, ValueError) as exc:
+            raise NavigationPlanningError("invalid_target", "navigation numeric options are invalid") from exc
+
+        goal_position = choose_reachable_goal(
+            reachable,
+            target_position,
+            min_distance=max(0.0, min_distance),
+            max_distance=max_distance,
+        )
+        if goal_position is None:
+            raise NavigationPlanningError(
+                "no_reachable_goal_near_target",
+                "no reachable position satisfies the target distance constraints",
+            )
+        start_position = find_nearest_position(reachable, robot_position)
+        if start_position is None:
+            raise NavigationPlanningError("no_reachable_positions", "could not align robot pose to a reachable position")
+
+        graph, node_positions = build_reachable_graph(reachable, grid_size=grid_size, epsilon=epsilon)
+        start_node = _node_for_position(start_position)
+        goal_node = _node_for_position(goal_position)
+        node_path = astar_path(graph, start_node, goal_node)
+        if node_path is None:
+            raise NavigationPlanningError("no_path", "no path between start and goal")
+        path = [node_positions[node] for node in node_path]
+        current_yaw = float((robot.rotation or {}).get("y", 0.0))
+        actions = path_to_actions(path, current_yaw=current_yaw, rotate_step_degrees=rotate_step)
+        if max_actions is not None and len(actions) > max_actions:
+            raise NavigationPlanningError(
+                "action_limit_exceeded",
+                f"planned {len(actions)} actions, exceeding max_actions={max_actions}",
+            )
+        estimated_distance = 0.0
+        for current, next_position in zip(path, path[1:]):
+            estimated_distance += _distance_xz(current, next_position)
+        return {
+            "status": "success",
+            "robot_id": robot.robot_id,
+            "target": target,
+            "target_position": target_position,
+            "start_position": start_position,
+            "goal_position": goal_position,
+            "path": path,
+            "actions": actions,
+            "estimated_distance": estimated_distance,
+            "planner": "reachable_positions_astar",
+            "grid_size": grid_size,
+            "rotate_step_degrees": rotate_step,
+        }
+
+    def goto(self, payload: dict) -> dict:
+        task_id = payload.get("task_id", "unknown") if isinstance(payload, dict) else "unknown"
+        try:
+            plan = self.plan_goto(payload)
+        except NavigationPlanningError as exc:
+            return {"status": "failed", "task_id": task_id, "error_code": exc.error_code, "error": str(exc)}
+        execute = bool(payload.get("execute", False))
+        result = {"task_id": task_id, **plan, "execute": execute}
+        if not execute:
+            return result
+        render_image = bool(payload.get("render_image", False))
+        stop_on_failure = bool(payload.get("stop_on_failure", True))
+        execute_result = self.execute_batch(
+            plan["actions"],
+            default_robot_ref=plan["robot_id"],
+            render_image=render_image,
+            stop_on_failure=stop_on_failure,
+        )
+        result["execute_result"] = execute_result
+        if execute_result.get("status") != "success":
+            result["status"] = "failed"
+            result["error_code"] = "execution_failed"
+            result["error"] = "navigation action execution failed"
+        return result
+
     def _select_spawn_positions(self, count: int) -> list[dict]:
         reachable = self._get_reachable_positions()
         if not reachable:
@@ -587,20 +904,24 @@ class NativeControllerThorServer:
             remaining.remove(best)
         return [dict(pos) for pos in selected]
 
-    def _get_reachable_positions(self) -> list[dict]:
+    def _get_reachable_positions(self, robot_ref=None) -> list[dict]:
         try:
-            event = self._controller_step({"action": "GetReachablePositions", "agentId": 0})
-            meta = self._event_for_robot(event, 0).metadata
+            if robot_ref is None and not self.robots:
+                robot_id = 0
+            else:
+                robot_id = self.resolve_robot(robot_ref).robot_id
+            event = self._controller_step({"action": "GetReachablePositions", "agentId": robot_id})
+            meta = self._event_for_robot(event, robot_id).metadata
             positions = meta.get("actionReturn") or []
         except Exception as exc:
             log_event("SIM OUT", f"WARNING GetReachablePositions failed: {exc}")
             return []
-        default_y = DEFAULT_AGENT_Y
         cleaned = []
         for pos in positions:
-            if "x" not in pos or "z" not in pos:
+            try:
+                cleaned.append(_position_dict(pos))
+            except NavigationPlanningError:
                 continue
-            cleaned.append({"x": float(pos["x"]), "y": float(pos.get("y", default_y)), "z": float(pos["z"])})
         return cleaned
 
     def _select_position_in_front_of_object(self, object_type: str, fallback: dict) -> dict:
@@ -860,6 +1181,14 @@ class NativeControllerReceiverHandler(BaseHTTPRequestHandler):
                 self._send_json(200, thor_instance.capture_state(robot_ref, render_image=render_image))
             except ValueError as exc:
                 self._send_json(400, {"status": "failed", "error": str(exc)})
+        elif parsed.path == "/reachable_positions":
+            if not self._controller_ready():
+                return
+            robot_ref = self._query_value(query, "robot_id")
+            try:
+                self._send_json(200, thor_instance.reachable_positions_response(robot_ref))
+            except ValueError as exc:
+                self._send_json(400, {"status": "failed", "error": str(exc)})
         else:
             self._send_json(404, {"status": "failed", "error": "not_found"})
 
@@ -870,6 +1199,8 @@ class NativeControllerReceiverHandler(BaseHTTPRequestHandler):
             self._handle_execute()
         elif parsed.path == "/observe":
             self._handle_observe()
+        elif parsed.path == "/goto":
+            self._handle_goto()
         elif parsed.path == "/reset":
             self._handle_reset()
         else:
@@ -918,6 +1249,32 @@ class NativeControllerReceiverHandler(BaseHTTPRequestHandler):
                     f"action={item.get('action')} error={item.get('error')}",
                 )
         self._send_json(200, result)
+
+    def _handle_goto(self):
+        if not self._controller_ready():
+            return
+        try:
+            payload = self._read_json()
+        except Exception as exc:
+            self._send_json(400, {"status": "failed", "error": f"invalid json: {exc}"})
+            return
+        task_id = payload.get("task_id", "unknown")
+        robot_ref = payload.get("robot_id", payload.get("robot", payload.get("agent_id")))
+        execute = bool(payload.get("execute", False))
+        log_event(
+            "REMOTE IN",
+            f"POST /goto task_id={task_id}, robot={robot_ref}, execute={execute}",
+            blank_before=True,
+        )
+        result = thor_instance.goto(payload)
+        log_event(
+            "REMOTE OUT",
+            f"POST /goto status={result.get('status')} actions={len(result.get('actions', []))}",
+        )
+        status_code = 200 if result.get("status") == "success" else 400
+        if result.get("error_code") == "execution_failed":
+            status_code = 200
+        self._send_json(status_code, result)
 
     def _handle_observe(self):
         if not self._controller_ready():
@@ -1022,8 +1379,10 @@ def main():
     log_event("SERVER OUT", "mode: native_standard_controller_shared_unity")
     log_event("SERVER OUT", "GET  /robots")
     log_event("SERVER OUT", "GET  /state")
+    log_event("SERVER OUT", "GET  /reachable_positions")
     log_event("SERVER OUT", "POST /observe")
     log_event("SERVER OUT", "POST /execute_actions")
+    log_event("SERVER OUT", "POST /goto")
     log_event("SERVER OUT", "POST /reset")
     try:
         if args.show:

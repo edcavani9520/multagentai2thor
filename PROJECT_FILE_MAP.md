@@ -21,7 +21,7 @@ AI2-THOR shared Unity scene, Controller(agentCount=N)
 
 | 路径 | 状态 | 作用 |
 | --- | --- | --- |
-| `ai2thor_receiver_server.py` | 主线 | 唯一保留的仿真 HTTP receiver。维护共享 Unity 场景，提供 `/robots`、`/state`、`/observe`、`/execute_actions`、`/reset`。 |
+| `ai2thor_receiver_server.py` | 主线 | 唯一保留的仿真 HTTP receiver。维护共享 Unity 场景，提供 `/robots`、`/state`、`/observe`、`/execute_actions`、`/reachable_positions`、`/goto`、`/reset`。 |
 | `relay_task_server.py` | 主线 | 常驻 HTTP 任务服务。复用 EmbodiedGPT 的 relay 和闭环重规划代码执行一个完整自然语言任务。 |
 | `EmbodiedGPT_Pytorch/demo/auto_scene_actions.py` | 主线引擎 | 任务意图、语义规划、grounding、动作执行反馈合并和闭环控制器。 |
 | `EmbodiedGPT_Pytorch/demo/relay_agent.py` | 主线引擎 | 受控工具调用的多 robot executor 选择与失败报告。 |

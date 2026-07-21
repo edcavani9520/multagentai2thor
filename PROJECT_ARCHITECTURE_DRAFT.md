@@ -631,7 +631,40 @@ AI2-THOR 动作失败是正常现象，原因包括：
 
 ---
 
-## 11. 与上层系统的接口边界
+## 11. 自动导航规划接口
+
+`ai2thor_receiver_server.py` 提供一个轻量确定性导航层，用于把目标位置或目标物体转换为 AI2-THOR 低层导航动作。该层不是 LLM 规划，也不是 AllenAct/ObjectNav policy；它基于 `GetReachablePositions` 构建二维可达图，并使用 A* 搜索得到路径。
+
+新增接口：
+
+```text
+GET  /reachable_positions?robot_id=0
+POST /goto
+```
+
+`/reachable_positions` 返回指定 robot 对应的 AI2-THOR reachable positions。`/goto` 支持 `target_position`、`object_id`、`object_type` 三类目标。对于物体目标，系统不会把物体中心作为终点，而是从 reachable positions 中选择满足距离约束的站立点，再将路径转换成 `RotateLeft`、`RotateRight` 和 `MoveAhead`。
+
+`/goto` 默认 `execute=false`，只返回规划结果；当请求显式设置 `execute=true` 时，服务端才会调用现有 `execute_batch` 执行动作。导航执行默认 `stop_on_failure=true`，如果某一步失败，返回 `execution_failed`，由调用方根据最新 pose 重新规划。
+
+请求示例：
+
+```json
+{
+  "task_id": "goto-001",
+  "robot_id": 0,
+  "object_type": "Fridge",
+  "execute": false,
+  "min_distance": 0.75,
+  "max_distance": 2.0,
+  "max_actions": 40
+}
+```
+
+响应包含 `target`、`goal_position`、`path`、`actions` 和 `estimated_distance`。常见失败包括 `invalid_target`、`target_not_found`、`no_reachable_positions`、`no_reachable_goal_near_target`、`no_path`、`action_limit_exceeded` 和 `execution_failed`。
+
+---
+
+## 12. 与上层系统的接口边界
 
 上层系统给本仓库的输入：
 
@@ -665,7 +698,7 @@ ai2thor_receiver_server.py 执行动作
 
 ---
 
-## 12. 后续建议
+## 13. 后续建议
 
 短期：
 

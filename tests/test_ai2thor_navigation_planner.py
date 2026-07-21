@@ -1,0 +1,209 @@
+from __future__ import annotations
+
+import unittest
+from types import MethodType
+
+import ai2thor_receiver_server as module
+from ai2thor_receiver_server import (
+    NativeControllerReceiverHandler,
+    NativeControllerThorServer,
+    RobotState,
+    astar_path,
+    build_reachable_graph,
+    choose_reachable_goal,
+    path_to_actions,
+)
+
+
+class NavigationPlannerPureFunctionTest(unittest.TestCase):
+    def test_reachable_graph_connects_only_four_neighbors(self) -> None:
+        positions = [
+            {"x": 0.0, "y": 0.9, "z": 0.0},
+            {"x": 0.25, "y": 0.9, "z": 0.0},
+            {"x": 0.0, "y": 0.9, "z": 0.25},
+            {"x": 0.25, "y": 0.9, "z": 0.25},
+        ]
+        graph, _ = build_reachable_graph(positions, grid_size=0.25, epsilon=0.01)
+
+        self.assertIn(((0.25, 0.0), 0.25), graph[(0.0, 0.0)])
+        self.assertIn(((0.0, 0.25), 0.25), graph[(0.0, 0.0)])
+        self.assertNotIn((0.25, 0.25), [node for node, _ in graph[(0.0, 0.0)]])
+
+    def test_astar_returns_shortest_grid_path(self) -> None:
+        positions = [
+            {"x": 0.0, "y": 0.9, "z": 0.0},
+            {"x": 0.25, "y": 0.9, "z": 0.0},
+            {"x": 0.5, "y": 0.9, "z": 0.0},
+        ]
+        graph, _ = build_reachable_graph(positions, grid_size=0.25, epsilon=0.01)
+
+        self.assertEqual(astar_path(graph, (0.0, 0.0), (0.5, 0.0)), [(0.0, 0.0), (0.25, 0.0), (0.5, 0.0)])
+
+    def test_astar_returns_none_when_disconnected(self) -> None:
+        positions = [
+            {"x": 0.0, "y": 0.9, "z": 0.0},
+            {"x": 1.0, "y": 0.9, "z": 0.0},
+        ]
+        graph, _ = build_reachable_graph(positions, grid_size=0.25, epsilon=0.01)
+
+        self.assertIsNone(astar_path(graph, (0.0, 0.0), (1.0, 0.0)))
+
+    def test_path_to_actions_uses_yaw_and_moveahead(self) -> None:
+        actions = path_to_actions(
+            [
+                {"x": 0.0, "y": 0.9, "z": 0.0},
+                {"x": 0.25, "y": 0.9, "z": 0.0},
+                {"x": 0.25, "y": 0.9, "z": 0.25},
+            ],
+            current_yaw=0.0,
+            rotate_step_degrees=90.0,
+        )
+
+        self.assertEqual(
+            actions,
+            [
+                {"action": "RotateRight"},
+                {"action": "MoveAhead"},
+                {"action": "RotateLeft"},
+                {"action": "MoveAhead"},
+            ],
+        )
+
+    def test_choose_reachable_goal_uses_standing_point_not_object_center(self) -> None:
+        reachable = [
+            {"x": 0.0, "y": 0.9, "z": 0.0},
+            {"x": 0.75, "y": 0.9, "z": 0.0},
+            {"x": 1.5, "y": 0.9, "z": 0.0},
+        ]
+
+        goal = choose_reachable_goal(
+            reachable,
+            {"x": 0.0, "y": 0.9, "z": 0.0},
+            min_distance=0.5,
+            max_distance=1.0,
+        )
+
+        self.assertEqual(goal, {"x": 0.75, "y": 0.9, "z": 0.0})
+
+
+class NavigationReceiverMethodTest(unittest.TestCase):
+    def fake_server(self) -> NativeControllerThorServer:
+        server = NativeControllerThorServer.__new__(NativeControllerThorServer)
+        server.robots = [
+            RobotState(
+                robot_id=0,
+                name="Robot0",
+                position={"x": 0.0, "y": 0.9, "z": 0.0},
+                rotation={"x": 0.0, "y": 0.0, "z": 0.0},
+            )
+        ]
+        return server
+
+    def test_reachable_positions_response(self) -> None:
+        server = self.fake_server()
+        server._get_reachable_positions = MethodType(
+            lambda self, robot_ref=None: [{"x": 0.0, "y": 0.9, "z": 0.0}],
+            server,
+        )
+
+        self.assertEqual(
+            server.reachable_positions_response(0),
+            {"status": "success", "robot_id": 0, "positions": [{"x": 0.0, "y": 0.9, "z": 0.0}]},
+        )
+
+    def test_goto_dry_run_returns_plan_without_executing(self) -> None:
+        server = self.fake_server()
+        server.capture_state = MethodType(lambda self, robot_ref=None, render_image=False: {"objects": []}, server)
+        server._get_reachable_positions = MethodType(
+            lambda self, robot_ref=None: [
+                {"x": 0.0, "y": 0.9, "z": 0.0},
+                {"x": 0.25, "y": 0.9, "z": 0.0},
+            ],
+            server,
+        )
+        server.execute_batch = MethodType(lambda *args, **kwargs: self.fail("dry-run /goto must not execute"), server)
+
+        result = server.goto({"task_id": "goto-1", "robot_id": 0, "target_position": {"x": 0.25, "z": 0.0}})
+
+        self.assertEqual(result["status"], "success")
+        self.assertFalse(result["execute"])
+        self.assertEqual(result["actions"], [{"action": "RotateRight"}, {"action": "MoveAhead"}])
+        self.assertNotIn("execute_result", result)
+
+    def test_goto_execute_calls_execute_batch_with_stop_on_failure_true(self) -> None:
+        server = self.fake_server()
+        calls = []
+        server.capture_state = MethodType(lambda self, robot_ref=None, render_image=False: {"objects": []}, server)
+        server._get_reachable_positions = MethodType(
+            lambda self, robot_ref=None: [
+                {"x": 0.0, "y": 0.9, "z": 0.0},
+                {"x": 0.0, "y": 0.9, "z": 0.25},
+            ],
+            server,
+        )
+
+        def execute_batch(self, actions, default_robot_ref=None, render_image=False, stop_on_failure=True):
+            calls.append(
+                {
+                    "actions": actions,
+                    "default_robot_ref": default_robot_ref,
+                    "render_image": render_image,
+                    "stop_on_failure": stop_on_failure,
+                }
+            )
+            return {"status": "success", "results": []}
+
+        server.execute_batch = MethodType(execute_batch, server)
+
+        result = server.goto(
+            {
+                "task_id": "goto-1",
+                "robot_id": 0,
+                "target_position": {"x": 0.0, "z": 0.25},
+                "execute": True,
+            }
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls[0]["actions"], [{"action": "MoveAhead"}])
+        self.assertEqual(calls[0]["default_robot_ref"], 0)
+        self.assertTrue(calls[0]["stop_on_failure"])
+
+    def test_goto_object_type_not_found(self) -> None:
+        server = self.fake_server()
+        server.capture_state = MethodType(lambda self, robot_ref=None, render_image=False: {"objects": []}, server)
+        server._get_reachable_positions = MethodType(lambda self, robot_ref=None: [], server)
+
+        result = server.goto({"task_id": "goto-1", "robot_id": 0, "object_type": "Fridge"})
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_code"], "target_not_found")
+
+    def test_handler_goto_dispatches_to_thor_instance(self) -> None:
+        class FakeThor:
+            controller = object()
+
+            def goto(self, payload):
+                self.payload = payload
+                return {"status": "success", "actions": [{"action": "MoveAhead"}]}
+
+        fake = FakeThor()
+        original = module.thor_instance
+        module.thor_instance = fake
+        try:
+            handler = NativeControllerReceiverHandler.__new__(NativeControllerReceiverHandler)
+            handler._controller_ready = MethodType(lambda self: True, handler)
+            handler._read_json = MethodType(lambda self: {"task_id": "goto-1", "execute": False}, handler)
+            sent = []
+            handler._send_json = MethodType(lambda self, code, payload: sent.append((code, payload)), handler)
+
+            handler._handle_goto()
+        finally:
+            module.thor_instance = original
+
+        self.assertEqual(sent, [(200, {"status": "success", "actions": [{"action": "MoveAhead"}]})])
+        self.assertEqual(fake.payload, {"task_id": "goto-1", "execute": False})
+
+
+if __name__ == "__main__":
+    unittest.main()
