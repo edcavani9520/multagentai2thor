@@ -193,10 +193,10 @@ def _yaw_for_step(current: dict[str, Any], next_position: dict[str, Any]) -> flo
     return math.degrees(math.atan2(dx, dz)) % 360.0
 
 
-def path_to_actions(
-    path: list[dict[str, Any]],
+def yaw_rotation_actions(
     *,
     current_yaw: float,
+    target_yaw: float,
     rotate_step_degrees: float = DEFAULT_ROTATE_STEP_DEGREES,
     yaw_tolerance_degrees: float = DEFAULT_YAW_TOLERANCE_DEGREES,
 ) -> list[dict[str, Any]]:
@@ -204,21 +204,38 @@ def path_to_actions(
         raise NavigationPlanningError("invalid_target", "rotate_step_degrees must be positive")
     if yaw_tolerance_degrees < 0:
         raise NavigationPlanningError("invalid_target", "yaw_tolerance_degrees must be non-negative")
+    delta = signed_angle_delta(target_yaw, current_yaw)
+    abs_delta = abs(delta)
+    if abs_delta <= yaw_tolerance_degrees:
+        return []
+    turn_action = "RotateRight" if delta > 0 else "RotateLeft"
+    turns = int(round(abs_delta / rotate_step_degrees))
+    snapped_degrees = turns * rotate_step_degrees
+    if turns > 0 and abs(abs_delta - snapped_degrees) <= yaw_tolerance_degrees:
+        return [{"action": turn_action} for _ in range(turns)]
+    return [{"action": turn_action, "degrees": abs_delta}]
+
+
+def path_to_actions(
+    path: list[dict[str, Any]],
+    *,
+    current_yaw: float,
+    rotate_step_degrees: float = DEFAULT_ROTATE_STEP_DEGREES,
+    yaw_tolerance_degrees: float = DEFAULT_YAW_TOLERANCE_DEGREES,
+) -> list[dict[str, Any]]:
     actions: list[dict[str, Any]] = []
     yaw = float(current_yaw) % 360.0
     for current, next_position in zip(path, path[1:]):
         target_yaw = _yaw_for_step(current, next_position)
-        delta = signed_angle_delta(target_yaw, yaw)
-        abs_delta = abs(delta)
-        if abs_delta > yaw_tolerance_degrees:
-            turn_action = "RotateRight" if delta > 0 else "RotateLeft"
-            turns = int(round(abs_delta / rotate_step_degrees))
-            snapped_degrees = turns * rotate_step_degrees
-            if turns > 0 and abs(abs_delta - snapped_degrees) <= yaw_tolerance_degrees:
-                actions.extend({"action": turn_action} for _ in range(turns))
-            else:
-                actions.append({"action": turn_action, "degrees": abs_delta})
-            yaw = target_yaw
+        actions.extend(
+            yaw_rotation_actions(
+                current_yaw=yaw,
+                target_yaw=target_yaw,
+                rotate_step_degrees=rotate_step_degrees,
+                yaw_tolerance_degrees=yaw_tolerance_degrees,
+            )
+        )
+        yaw = target_yaw
         actions.append({"action": "MoveAhead"})
     return actions
 
@@ -818,6 +835,7 @@ class NativeControllerThorServer:
         epsilon = float(payload.get("grid_epsilon", DEFAULT_GRID_EPSILON))
         rotate_step = float(payload.get("rotate_step_degrees", DEFAULT_ROTATE_STEP_DEGREES))
         max_actions = payload.get("max_actions")
+        face_target = bool(payload.get("face_target", has_object_target))
         try:
             min_distance = float(min_distance)
             max_distance = float(max_distance) if max_distance is not None else None
@@ -849,6 +867,16 @@ class NativeControllerThorServer:
         path = [node_positions[node] for node in node_path]
         current_yaw = float((robot.rotation or {}).get("y", 0.0))
         actions = path_to_actions(path, current_yaw=current_yaw, rotate_step_degrees=rotate_step)
+        final_yaw = current_yaw if len(path) < 2 else _yaw_for_step(path[-2], path[-1])
+        face_target_yaw = _yaw_for_step(goal_position, target_position)
+        if face_target:
+            actions.extend(
+                yaw_rotation_actions(
+                    current_yaw=final_yaw,
+                    target_yaw=face_target_yaw,
+                    rotate_step_degrees=rotate_step,
+                )
+            )
         if max_actions is not None and len(actions) > max_actions:
             raise NavigationPlanningError(
                 "action_limit_exceeded",
@@ -867,6 +895,8 @@ class NativeControllerThorServer:
             "path": path,
             "actions": actions,
             "estimated_distance": estimated_distance,
+            "face_target": face_target,
+            "face_target_yaw": face_target_yaw,
             "planner": "reachable_positions_astar",
             "grid_size": grid_size,
             "rotate_step_degrees": rotate_step,

@@ -12,6 +12,7 @@ from ai2thor_receiver_server import (
     build_reachable_graph,
     choose_reachable_goal,
     path_to_actions,
+    yaw_rotation_actions,
 )
 
 
@@ -68,6 +69,12 @@ class NavigationPlannerPureFunctionTest(unittest.TestCase):
                 {"action": "MoveAhead"},
             ],
         )
+
+    def test_yaw_rotation_actions_uses_precise_degrees_for_non_grid_yaw(self) -> None:
+        actions = yaw_rotation_actions(current_yaw=90.0, target_yaw=41.1859)
+
+        self.assertEqual(actions[0]["action"], "RotateLeft")
+        self.assertAlmostEqual(actions[0]["degrees"], 48.8141)
 
     def test_path_to_actions_corrects_non_grid_initial_yaw(self) -> None:
         actions = path_to_actions(
@@ -162,6 +169,67 @@ class NavigationReceiverMethodTest(unittest.TestCase):
         self.assertEqual(result["actions"][0]["action"], "RotateLeft")
         self.assertAlmostEqual(result["actions"][0]["degrees"], 41.1859)
         self.assertEqual(result["actions"][1], {"action": "MoveAhead"})
+
+    def test_goto_dry_run_faces_object_target_after_reaching_goal(self) -> None:
+        server = self.fake_server(yaw=0.0)
+        server.capture_state = MethodType(
+            lambda self, robot_ref=None, render_image=False: {
+                "objects": [
+                    {
+                        "id": "Target|1",
+                        "type": "Target",
+                        "position": {"x": 0.25, "y": 0.0, "z": 0.25},
+                    }
+                ]
+            },
+            server,
+        )
+        server._get_reachable_positions = MethodType(
+            lambda self, robot_ref=None: [
+                {"x": 0.0, "y": 0.9, "z": 0.0},
+                {"x": 0.0, "y": 0.9, "z": 0.25},
+            ],
+            server,
+        )
+        server.execute_batch = MethodType(lambda *args, **kwargs: self.fail("dry-run /goto must not execute"), server)
+
+        result = server.goto({"task_id": "goto-1", "robot_id": 0, "object_type": "Target", "min_distance": 0.0})
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["actions"], [{"action": "MoveAhead"}, {"action": "RotateRight"}])
+        self.assertTrue(result["face_target"])
+        self.assertEqual(result["face_target_yaw"], 90.0)
+
+    def test_goto_dry_run_can_disable_face_target(self) -> None:
+        server = self.fake_server(yaw=0.0)
+        server.capture_state = MethodType(
+            lambda self, robot_ref=None, render_image=False: {
+                "objects": [
+                    {
+                        "id": "Target|1",
+                        "type": "Target",
+                        "position": {"x": 0.25, "y": 0.0, "z": 0.25},
+                    }
+                ]
+            },
+            server,
+        )
+        server._get_reachable_positions = MethodType(
+            lambda self, robot_ref=None: [
+                {"x": 0.0, "y": 0.9, "z": 0.0},
+                {"x": 0.0, "y": 0.9, "z": 0.25},
+            ],
+            server,
+        )
+        server.execute_batch = MethodType(lambda *args, **kwargs: self.fail("dry-run /goto must not execute"), server)
+
+        result = server.goto(
+            {"task_id": "goto-1", "robot_id": 0, "object_type": "Target", "min_distance": 0.0, "face_target": False}
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["actions"], [{"action": "MoveAhead"}])
+        self.assertFalse(result["face_target"])
 
     def test_goto_execute_calls_execute_batch_with_stop_on_failure_true(self) -> None:
         server = self.fake_server()
