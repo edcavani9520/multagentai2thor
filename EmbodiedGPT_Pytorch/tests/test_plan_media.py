@@ -1629,6 +1629,126 @@ class ObjectVisibilityMapTest(unittest.TestCase):
         self.assertEqual(output["step_payloads"][0]["robot_id"], 0)
         self.assertEqual(output["queried_robot_ids"], [0])
 
+    def test_navigation_only_intent_extracts_object_type(self) -> None:
+        self.assertEqual(
+            auto_scene_actions_module.navigation_object_type_for_task("go to the fridge.", ["Fridge"]),
+            "Fridge",
+        )
+        self.assertEqual(
+            auto_scene_actions_module.navigation_object_type_for_task("move to the counter", ["CounterTop"]),
+            "CounterTop",
+        )
+        self.assertEqual(
+            auto_scene_actions_module.navigation_object_type_for_task("walk to the tomato", ["Tomato"]),
+            "Tomato",
+        )
+
+    def test_interaction_task_does_not_trigger_navigation_only_intent(self) -> None:
+        self.assertIsNone(
+            auto_scene_actions_module.navigation_object_type_for_task(
+                "put the tomato on the counter.",
+                ["Tomato", "CounterTop"],
+            )
+        )
+
+    def test_goto_url_from_execute_actions_url(self) -> None:
+        self.assertEqual(
+            auto_scene_actions_module.goto_url_from_execute_actions_url(
+                "http://host:19000/execute_actions",
+                "/goto",
+            ),
+            "http://host:19000/goto",
+        )
+
+    def test_navigation_only_run_calls_goto_without_qwen(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 1,
+                "robots": [{"robot_id": 0}, {"robot_id": 1}],
+                "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": False}],
+                "image_base64": "eA==",
+                "results": [{"robot_id": 1, "image_base64": "eA=="}],
+                "state": {
+                    "sceneName": "FloorPlan1",
+                    "selected_robot_id": 1,
+                    "robots": [{"robot_id": 0}, {"robot_id": 1}],
+                    "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": False}],
+                },
+            }
+            captured: dict[str, object] = {}
+            old_probe = auto_scene_actions_module.probe_scene
+            old_post_json = auto_scene_actions_module.post_json
+            old_generate_intent = auto_scene_actions_module.generate_task_intent_tool_call
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+
+            def fake_post_json(url, payload, timeout):
+                captured["url"] = url
+                captured["payload"] = payload
+                return {
+                    "status": "success",
+                    "robot_id": payload["robot_id"],
+                    "planner": "reachable_positions_astar",
+                    "actions": [{"action": "MoveAhead"}],
+                    "execute": payload["execute"],
+                    "goal_position": {"x": 0.0, "y": 0.9, "z": 1.0},
+                    "execute_result": {"status": "success", "results": []},
+                }
+
+            auto_scene_actions_module.post_json = fake_post_json
+            auto_scene_actions_module.generate_task_intent_tool_call = lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("navigation-only task must not call Qwen intent extraction")
+            )
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:19000/execute_actions",
+                        "--task",
+                        "go to the fridge.",
+                        "--task-id",
+                        "goto-task-1",
+                        "--primary-robot-id",
+                        "1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--closed-loop-replan",
+                        "--goto-max-actions",
+                        "40",
+                        "--goto-min-distance",
+                        "0.75",
+                        "--goto-max-distance",
+                        "2.0",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.post_json = old_post_json
+                auto_scene_actions_module.generate_task_intent_tool_call = old_generate_intent
+
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured["url"], "http://127.0.0.1:19000/goto")
+        self.assertEqual(
+            captured["payload"],
+            {
+                "task_id": "goto-task-1",
+                "robot_id": 1,
+                "object_type": "Fridge",
+                "execute": True,
+                "max_actions": 40,
+                "min_distance": 0.75,
+                "max_distance": 2.0,
+            },
+        )
+        self.assertEqual(output["task_intent_source"], "navigation_goto_intent")
+        self.assertEqual(output["closed_loop_result"], {"status": "success", "strategy": "goto"})
+        self.assertEqual(output["goto_result_summary"]["action_count"], 1)
+
     def test_probe_scene_uses_execute_actions_pass_with_primary_robot_id(self) -> None:
         captured: dict[str, object] = {}
 

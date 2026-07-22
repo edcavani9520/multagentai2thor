@@ -230,6 +230,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Remote observe endpoint path, relative to the execute_actions base URL.",
     )
     parser.add_argument(
+        "--goto-endpoint",
+        default="/goto",
+        help="Remote goto endpoint path, relative to the execute_actions base URL.",
+    )
+    parser.add_argument(
+        "--goto-max-actions",
+        type=int,
+        help="Optional max_actions value forwarded to /goto for navigation-only tasks.",
+    )
+    parser.add_argument(
+        "--goto-min-distance",
+        type=positive_float,
+        help="Optional min_distance value forwarded to /goto for navigation-only tasks.",
+    )
+    parser.add_argument(
+        "--goto-max-distance",
+        type=positive_float,
+        help="Optional max_distance value forwarded to /goto for navigation-only tasks.",
+    )
+    parser.add_argument(
         "--include-object-visibility-map",
         action="store_true",
         help="Include the full object visibility map in stdout. Defaults to a compact summary only.",
@@ -331,6 +351,167 @@ def endpoint_url(base_url: str, endpoint: str, query: dict[str, Any] | None = No
     path = endpoint if endpoint.startswith("/") else f"/{endpoint}"
     encoded = urlencode(query or {})
     return f"{base}{path}" + (f"?{encoded}" if encoded else "")
+
+
+def goto_url_from_execute_actions_url(execute_actions_url: str, goto_endpoint: str = "/goto") -> str:
+    return endpoint_url(base_url_from_execute_actions_url(execute_actions_url), goto_endpoint)
+
+
+NAVIGATION_ONLY_PATTERN = re.compile(
+    r"^\s*(?:please\s+)?(?:go|navigate|move|walk|head)(?:\s+(?:over|up))?\s+to\s+(?:the\s+|a\s+|an\s+)?(.+?)\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+NAVIGATION_TARGET_TRAILING_PATTERN = re.compile(
+    r"\s+(?:please|now|nearby|near|area|location|place)$",
+    re.IGNORECASE,
+)
+
+
+def _clean_navigation_target_text(value: str) -> str:
+    target = value.strip().strip('"\'`.,!?;:')
+    target = re.sub(r"\b(?:please|now)\b", "", target, flags=re.IGNORECASE)
+    target = re.sub(r"\s+", " ", target).strip()
+    while True:
+        cleaned = NAVIGATION_TARGET_TRAILING_PATTERN.sub("", target).strip()
+        if cleaned == target:
+            return target
+        target = cleaned
+
+
+def navigation_object_type_for_task(task: str, available_object_types: list[str] | set[str]) -> str | None:
+    if not isinstance(task, str):
+        return None
+    match = NAVIGATION_ONLY_PATTERN.match(task)
+    if not match:
+        return None
+    target_text = _clean_navigation_target_text(match.group(1))
+    if not target_text:
+        return None
+    lookup = _object_type_lookup(set(available_object_types) | COMMON_OBJECT_TYPES)
+    normalized = normalize_type(target_text)
+    if normalized in lookup:
+        return lookup[normalized]
+    words = target_text.split()
+    for start in range(1, len(words)):
+        suffix = normalize_type(" ".join(words[start:]))
+        if suffix in lookup:
+            return lookup[suffix]
+    containing_matches = [
+        (len(key), object_type)
+        for key, object_type in lookup.items()
+        if key and key in normalized
+    ]
+    if containing_matches:
+        return max(containing_matches, key=lambda item: item[0])[1]
+    return None
+
+
+def goto_payload_for_navigation_task(args: argparse.Namespace, task_id: str, object_type: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "task_id": task_id,
+        "robot_id": args.primary_robot_id,
+        "object_type": object_type,
+        "execute": not bool(args.dry_run),
+    }
+    if args.goto_max_actions is not None:
+        payload["max_actions"] = args.goto_max_actions
+    if args.goto_min_distance is not None:
+        payload["min_distance"] = args.goto_min_distance
+    if args.goto_max_distance is not None:
+        payload["max_distance"] = args.goto_max_distance
+    return payload
+
+
+def summarize_goto_result(response: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for key in ("status", "error_code", "planner", "robot_id", "estimated_distance", "execute"):
+        if key in response:
+            summary[key] = response[key]
+    actions = response.get("actions")
+    if isinstance(actions, list):
+        summary["action_count"] = len(actions)
+    path = response.get("path")
+    if isinstance(path, list):
+        summary["path_length"] = len(path)
+    for key in ("target", "target_position", "goal_position", "start_position"):
+        if isinstance(response.get(key), dict):
+            summary[key] = response[key]
+    execute_result = response.get("execute_result")
+    if isinstance(execute_result, dict):
+        summary["execute_result_status"] = execute_result.get("status")
+        results = execute_result.get("results")
+        if isinstance(results, list):
+            summary["execute_result_count"] = len(results)
+            for item in results:
+                if isinstance(item, dict) and item.get("success") is False:
+                    summary["failed_action"] = {
+                        "index": item.get("index"),
+                        "action": item.get("action"),
+                        "error": item.get("error"),
+                    }
+                    break
+    if response.get("error") is not None:
+        summary["error"] = response.get("error")
+    return summary
+
+
+def navigation_goto_result(
+    args: argparse.Namespace,
+    *,
+    task_id: str,
+    base_url: str,
+    probe: dict[str, Any],
+    primary_observation: dict[str, Any],
+    image_path: Path,
+    object_type: str,
+) -> dict[str, Any]:
+    payload = goto_payload_for_navigation_task(args, task_id, object_type)
+    goto_url = endpoint_url(base_url, args.goto_endpoint)
+    print(
+        f"[goto] robot_{args.primary_robot_id} navigating to {object_type} via {goto_url}...",
+        file=sys.stderr,
+    )
+    goto_response = post_json(goto_url, payload, args.send_timeout)
+    summary = summarize_goto_result(goto_response)
+    status = goto_response.get("status")
+    if status == "success":
+        closed_loop_result = {"status": "success", "strategy": "goto"}
+        print(
+            f"[goto] success: {summary.get('action_count', 0)} actions, goal_position={summary.get('goal_position')}",
+            file=sys.stderr,
+        )
+    else:
+        reason = goto_response.get("error") or goto_response.get("reason") or f"/goto returned status {status!r}"
+        closed_loop_result = {
+            "status": "needs_upstream_planning",
+            "strategy": "goto",
+            "failure_code": goto_response.get("error_code") or status or "goto_failed",
+            "reason": reason,
+        }
+        print(f"[goto] failed: {reason}", file=sys.stderr)
+    result = {
+        "task_id": task_id,
+        "image_path": str(image_path),
+        "sceneName": primary_observation.get("sceneName") or probe.get("sceneName"),
+        "primary_agent_id": primary_observation.get("agent_id"),
+        "primary_robot_id": primary_observation.get("robot_id", args.primary_robot_id),
+        "visible_object_types": object_categories(primary_observation.get("objects", []), visible_only=True),
+        "task_intent": {
+            "requestedAction": "GotoObject",
+            "requestedObjectType": object_type,
+            "intentSteps": [
+                {"order": 1, "action": "GotoObject", "objectType": object_type, "targetType": None}
+            ],
+        },
+        "task_intent_source": "navigation_goto_intent",
+        "goto_url": goto_url,
+        "goto_payload": payload,
+        "goto_result_summary": summary,
+        "closed_loop_result": closed_loop_result,
+    }
+    if args.include_execute_response:
+        result["goto_result"] = goto_response
+    return result
 
 
 def get_state(
@@ -4451,6 +4632,23 @@ def run(args: argparse.Namespace) -> int:
             + (", ".join(object_categories(objects, visible_only=True)) or "(none)"),
             file=sys.stderr,
         )
+
+        navigation_object_type = navigation_object_type_for_task(
+            args.task,
+            object_categories(objects, visible_only=False),
+        )
+        if navigation_object_type is not None:
+            result = navigation_goto_result(
+                args,
+                task_id=task_id,
+                base_url=base_url,
+                probe=probe,
+                primary_observation=primary_observation,
+                image_path=image_path,
+                object_type=navigation_object_type,
+            )
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
 
         print("Generating task intent tool call with Qwen...", file=sys.stderr)
         task_intent_tool_call, task_intent, task_intent_tool_call_validation = generate_task_intent_tool_call(
