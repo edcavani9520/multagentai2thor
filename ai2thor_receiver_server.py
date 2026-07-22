@@ -145,6 +145,36 @@ def build_reachable_graph(
     return graph, node_positions
 
 
+def nodes_within_radius(
+    node_positions: dict[tuple[float, float], dict[str, float]],
+    center: dict[str, Any],
+    *,
+    radius: float,
+) -> set[tuple[float, float]]:
+    if radius <= 0:
+        return set()
+    return {
+        node
+        for node, position in node_positions.items()
+        if _distance_xz(position, center) <= radius
+    }
+
+
+def remove_graph_nodes(
+    graph: dict[tuple[float, float], list[tuple[tuple[float, float], float]]],
+    blocked_nodes: set[tuple[float, float]],
+    *,
+    preserve_nodes: set[tuple[float, float]] | None = None,
+) -> dict[tuple[float, float], list[tuple[tuple[float, float], float]]]:
+    preserve_nodes = preserve_nodes or set()
+    blocked = blocked_nodes - preserve_nodes
+    return {
+        node: [(neighbor, cost) for neighbor, cost in edges if neighbor not in blocked]
+        for node, edges in graph.items()
+        if node not in blocked
+    }
+
+
 def astar_path(
     graph: dict[tuple[float, float], list[tuple[tuple[float, float], float]]],
     start: tuple[float, float],
@@ -816,7 +846,7 @@ class NativeControllerThorServer:
         positions = self._get_reachable_positions(robot.robot_id)
         return {"status": "success", "robot_id": robot.robot_id, "positions": positions}
 
-    def plan_goto(self, payload: dict) -> dict:
+    def plan_goto(self, payload: dict, dynamic_obstacles: list[dict[str, Any]] | None = None) -> dict:
         if not isinstance(payload, dict):
             raise NavigationPlanningError("invalid_target", "payload must be an object")
         robot_ref = payload.get("robot_id", payload.get("robot", payload.get("agent_id")))
@@ -843,8 +873,51 @@ class NativeControllerThorServer:
         except (TypeError, ValueError) as exc:
             raise NavigationPlanningError("invalid_target", "navigation numeric options are invalid") from exc
 
+        start_position = find_nearest_position(reachable, robot_position)
+        if start_position is None:
+            raise NavigationPlanningError("no_reachable_positions", "could not align robot pose to a reachable position")
+
+        graph, node_positions = build_reachable_graph(reachable, grid_size=grid_size, epsilon=epsilon)
+        start_node = _node_for_position(start_position)
+        dynamic_obstacle_radius_default = 0.35 if dynamic_obstacles else 0.0
+        try:
+            dynamic_obstacle_radius = float(payload.get("dynamic_obstacle_radius", dynamic_obstacle_radius_default))
+        except (TypeError, ValueError) as exc:
+            raise NavigationPlanningError("invalid_target", "navigation numeric options are invalid") from exc
+        blocked_nodes: set[tuple[float, float]] = set()
+        dynamic_obstacle_summaries: list[dict[str, Any]] = []
+        for obstacle in dynamic_obstacles or []:
+            obstacle_position = obstacle.get("position") if isinstance(obstacle, dict) else None
+            if not isinstance(obstacle_position, dict):
+                continue
+            try:
+                clean_position = _position_dict(obstacle_position, field="obstacle.position")
+            except NavigationPlanningError:
+                continue
+            obstacle_nodes = nodes_within_radius(
+                node_positions,
+                clean_position,
+                radius=max(0.0, dynamic_obstacle_radius),
+            )
+            nearest_position = find_nearest_position(list(node_positions.values()), clean_position)
+            summary = {
+                "robot_id": obstacle.get("robot_id"),
+                "name": obstacle.get("name"),
+                "position": clean_position,
+                "blocked_node_count": len(obstacle_nodes),
+            }
+            if nearest_position is not None:
+                summary["nearest_node"] = {"x": nearest_position["x"], "z": nearest_position["z"]}
+            dynamic_obstacle_summaries.append(summary)
+            blocked_nodes.update(obstacle_nodes)
+
+        planning_reachable = [
+            position
+            for position in reachable
+            if _node_for_position(position) == start_node or _node_for_position(position) not in blocked_nodes
+        ]
         goal_position = choose_reachable_goal(
-            reachable,
+            planning_reachable,
             target_position,
             min_distance=max(0.0, min_distance),
             max_distance=max_distance,
@@ -854,13 +927,8 @@ class NativeControllerThorServer:
                 "no_reachable_goal_near_target",
                 "no reachable position satisfies the target distance constraints",
             )
-        start_position = find_nearest_position(reachable, robot_position)
-        if start_position is None:
-            raise NavigationPlanningError("no_reachable_positions", "could not align robot pose to a reachable position")
-
-        graph, node_positions = build_reachable_graph(reachable, grid_size=grid_size, epsilon=epsilon)
-        start_node = _node_for_position(start_position)
         goal_node = _node_for_position(goal_position)
+        graph = remove_graph_nodes(graph, blocked_nodes, preserve_nodes={start_node})
         node_path = astar_path(graph, start_node, goal_node)
         if node_path is None:
             raise NavigationPlanningError("no_path", "no path between start and goal")
@@ -900,32 +968,180 @@ class NativeControllerThorServer:
             "planner": "reachable_positions_astar",
             "grid_size": grid_size,
             "rotate_step_degrees": rotate_step,
+            "dynamic_obstacles": dynamic_obstacle_summaries,
+            "blocked_node_count": len(blocked_nodes),
         }
+
+    def _dynamic_obstacles_for_robot(self, robot_id: int) -> list[dict[str, Any]]:
+        obstacles: list[dict[str, Any]] = []
+        for robot in self.robots:
+            if robot.robot_id == robot_id:
+                continue
+            if not isinstance(robot.position, dict):
+                continue
+            obstacles.append({
+                "robot_id": robot.robot_id,
+                "name": robot.name,
+                "position": dict(robot.position),
+            })
+        return obstacles
+
+    @staticmethod
+    def _first_failed_action(execute_result: dict) -> dict | None:
+        for item in execute_result.get("results", []):
+            if not item.get("success"):
+                return item
+        return None
+
+    @staticmethod
+    def _execution_status(results: list[dict[str, Any]], expected_count: int) -> str:
+        if len(results) == expected_count and all(item.get("success") for item in results):
+            return "success"
+        if any(item.get("success") for item in results):
+            return "partial"
+        return "failed"
+
+    def _plan_goto_with_dynamic_obstacles(
+        self,
+        payload: dict,
+        *,
+        avoid_other_robots: bool,
+    ) -> dict:
+        robot_ref = payload.get("robot_id", payload.get("robot", payload.get("agent_id")))
+        robot = self.resolve_robot(robot_ref)
+        dynamic_obstacles = self._dynamic_obstacles_for_robot(robot.robot_id) if avoid_other_robots else []
+        return self.plan_goto(payload, dynamic_obstacles=dynamic_obstacles)
 
     def goto(self, payload: dict) -> dict:
         task_id = payload.get("task_id", "unknown") if isinstance(payload, dict) else "unknown"
+        execute = bool(payload.get("execute", False)) if isinstance(payload, dict) else False
+        avoid_other_robots = bool(payload.get("avoid_other_robots", True)) if isinstance(payload, dict) else True
         try:
-            plan = self.plan_goto(payload)
+            if execute:
+                plan = self._plan_goto_with_dynamic_obstacles(payload, avoid_other_robots=avoid_other_robots)
+            else:
+                plan = self.plan_goto(payload)
         except NavigationPlanningError as exc:
             return {"status": "failed", "task_id": task_id, "error_code": exc.error_code, "error": str(exc)}
-        execute = bool(payload.get("execute", False))
         result = {"task_id": task_id, **plan, "execute": execute}
         if not execute:
             return result
+
         render_image = bool(payload.get("render_image", False))
         stop_on_failure = bool(payload.get("stop_on_failure", True))
-        execute_result = self.execute_batch(
-            plan["actions"],
-            default_robot_ref=plan["robot_id"],
-            render_image=render_image,
-            stop_on_failure=stop_on_failure,
-        )
-        result["execute_result"] = execute_result
-        if execute_result.get("status") != "success":
-            result["status"] = "failed"
-            result["error_code"] = "execution_failed"
-            result["error"] = "navigation action execution failed"
-        return result
+        try:
+            max_replans = max(0, int(payload.get("max_replans", 3)))
+            chunk_size = max(1, int(payload.get("replan_chunk_actions", 6)))
+        except (TypeError, ValueError):
+            result.update({
+                "status": "failed",
+                "error_code": "invalid_target",
+                "error": "navigation replanning options are invalid",
+            })
+            return result
+
+        all_results: list[dict[str, Any]] = []
+        replan_trace: list[dict[str, Any]] = []
+        replan_count = 0
+        plan_attempt = 0
+        last_failure: dict | None = None
+        expected_action_count = 0
+
+        while True:
+            expected_action_count += len(plan.get("actions", []))
+            trace_item: dict[str, Any] = {
+                "attempt": plan_attempt,
+                "replan_count": replan_count,
+                "start_position": plan.get("start_position"),
+                "goal_position": plan.get("goal_position"),
+                "path_length": len(plan.get("path", [])),
+                "action_count": len(plan.get("actions", [])),
+                "dynamic_obstacles": plan.get("dynamic_obstacles", []),
+                "blocked_node_count": plan.get("blocked_node_count", 0),
+                "segments": [],
+            }
+            replan_trace.append(trace_item)
+            actions = list(plan.get("actions", []))
+            segment_failed = False
+            for offset in range(0, len(actions), chunk_size):
+                segment = actions[offset: offset + chunk_size]
+                execute_result = self.execute_batch(
+                    segment,
+                    default_robot_ref=plan["robot_id"],
+                    render_image=render_image,
+                    stop_on_failure=stop_on_failure,
+                )
+                segment_summary = {
+                    "action_offset": offset,
+                    "action_count": len(segment),
+                    "status": execute_result.get("status"),
+                }
+                failed_action = self._first_failed_action(execute_result)
+                if failed_action is not None:
+                    segment_summary["failed_action"] = failed_action
+                trace_item["segments"].append(segment_summary)
+                for item in execute_result.get("results", []):
+                    item = dict(item)
+                    item["index"] = len(all_results)
+                    all_results.append(item)
+                if execute_result.get("status") != "success":
+                    last_failure = failed_action
+                    segment_failed = True
+                    break
+            if not segment_failed:
+                result.update({
+                    "status": "success",
+                    "execute_result": {
+                        "status": "success",
+                        "results": all_results,
+                        "state": self.capture_state(plan["robot_id"]),
+                    },
+                    "replan_count": replan_count,
+                    "replan_trace": replan_trace,
+                    "executed_action_count": len(all_results),
+                    "avoid_other_robots": avoid_other_robots,
+                })
+                return result
+            if replan_count >= max_replans:
+                result.update({
+                    "status": "failed",
+                    "error_code": "execution_failed_after_replans",
+                    "error": "navigation action execution failed after replanning",
+                    "execute_result": {
+                        "status": self._execution_status(all_results, expected_action_count),
+                        "results": all_results,
+                        "state": self.capture_state(plan["robot_id"]),
+                    },
+                    "replan_count": replan_count,
+                    "replan_trace": replan_trace,
+                    "executed_action_count": len(all_results),
+                    "failed_action": last_failure,
+                    "avoid_other_robots": avoid_other_robots,
+                })
+                return result
+            replan_count += 1
+            plan_attempt += 1
+            try:
+                plan = self._plan_goto_with_dynamic_obstacles(payload, avoid_other_robots=avoid_other_robots)
+            except NavigationPlanningError as exc:
+                result.update({
+                    "status": "failed",
+                    "error_code": "execution_failed_after_replans",
+                    "error": "navigation action execution failed and replanning did not find a valid path",
+                    "replan_error_code": exc.error_code,
+                    "replan_error": str(exc),
+                    "execute_result": {
+                        "status": self._execution_status(all_results, expected_action_count),
+                        "results": all_results,
+                        "state": self.capture_state(plan["robot_id"]),
+                    },
+                    "replan_count": replan_count,
+                    "replan_trace": replan_trace,
+                    "executed_action_count": len(all_results),
+                    "failed_action": last_failure,
+                    "avoid_other_robots": avoid_other_robots,
+                })
+                return result
 
     def _select_spawn_positions(self, count: int) -> list[dict]:
         reachable = self._get_reachable_positions()

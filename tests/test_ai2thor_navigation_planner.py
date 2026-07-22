@@ -12,6 +12,7 @@ from ai2thor_receiver_server import (
     build_reachable_graph,
     choose_reachable_goal,
     path_to_actions,
+    remove_graph_nodes,
     yaw_rotation_actions,
 )
 
@@ -48,6 +49,20 @@ class NavigationPlannerPureFunctionTest(unittest.TestCase):
         graph, _ = build_reachable_graph(positions, grid_size=0.25, epsilon=0.01)
 
         self.assertIsNone(astar_path(graph, (0.0, 0.0), (1.0, 0.0)))
+
+    def test_remove_graph_nodes_blocks_dynamic_obstacle_but_preserves_start(self) -> None:
+        positions = [
+            {"x": 0.0, "y": 0.9, "z": 0.0},
+            {"x": 0.25, "y": 0.9, "z": 0.0},
+            {"x": 0.5, "y": 0.9, "z": 0.0},
+        ]
+        graph, _ = build_reachable_graph(positions, grid_size=0.25, epsilon=0.01)
+
+        pruned = remove_graph_nodes(graph, {(0.25, 0.0), (0.0, 0.0)}, preserve_nodes={(0.0, 0.0)})
+
+        self.assertIn((0.0, 0.0), pruned)
+        self.assertNotIn((0.25, 0.0), pruned)
+        self.assertNotIn((0.25, 0.0), [node for node, _ in pruned[(0.0, 0.0)]])
 
     def test_path_to_actions_uses_yaw_and_moveahead(self) -> None:
         actions = path_to_actions(
@@ -231,6 +246,44 @@ class NavigationReceiverMethodTest(unittest.TestCase):
         self.assertEqual(result["actions"], [{"action": "MoveAhead"}])
         self.assertFalse(result["face_target"])
 
+    def test_plan_goto_avoids_other_robot_dynamic_obstacle(self) -> None:
+        server = self.fake_server()
+        server.robots.append(
+            RobotState(
+                robot_id=1,
+                name="Robot1",
+                position={"x": 0.25, "y": 0.9, "z": 0.0},
+                rotation={"x": 0.0, "y": 0.0, "z": 0.0},
+            )
+        )
+        server.capture_state = MethodType(lambda self, robot_ref=None, render_image=False: {"objects": []}, server)
+        server._get_reachable_positions = MethodType(
+            lambda self, robot_ref=None: [
+                {"x": 0.0, "y": 0.9, "z": 0.0},
+                {"x": 0.25, "y": 0.9, "z": 0.0},
+                {"x": 0.5, "y": 0.9, "z": 0.0},
+                {"x": 0.0, "y": 0.9, "z": 0.25},
+                {"x": 0.25, "y": 0.9, "z": 0.25},
+                {"x": 0.5, "y": 0.9, "z": 0.25},
+            ],
+            server,
+        )
+
+        result = server.plan_goto(
+            {
+                "task_id": "goto-1",
+                "robot_id": 0,
+                "target_position": {"x": 0.5, "z": 0.0},
+                "dynamic_obstacle_radius": 0.01,
+            },
+            dynamic_obstacles=server._dynamic_obstacles_for_robot(0),
+        )
+
+        self.assertNotIn({"x": 0.25, "y": 0.9, "z": 0.0}, result["path"])
+        self.assertEqual(result["goal_position"], {"x": 0.5, "y": 0.9, "z": 0.0})
+        self.assertEqual(result["dynamic_obstacles"][0]["robot_id"], 1)
+        self.assertGreater(result["blocked_node_count"], 0)
+
     def test_goto_execute_calls_execute_batch_with_stop_on_failure_true(self) -> None:
         server = self.fake_server()
         calls = []
@@ -269,6 +322,143 @@ class NavigationReceiverMethodTest(unittest.TestCase):
         self.assertEqual(calls[0]["actions"], [{"action": "MoveAhead"}])
         self.assertEqual(calls[0]["default_robot_ref"], 0)
         self.assertTrue(calls[0]["stop_on_failure"])
+
+    def test_goto_replans_after_blocking_failure_and_succeeds(self) -> None:
+        server = self.fake_server()
+        server.robots.append(
+            RobotState(
+                robot_id=1,
+                name="Robot1",
+                position={"x": 0.25, "y": 0.9, "z": 0.0},
+                rotation={"x": 0.0, "y": 0.0, "z": 0.0},
+            )
+        )
+        server.capture_state = MethodType(lambda self, robot_ref=None, render_image=False: {"objects": []}, server)
+        plan_calls = []
+        plans = [
+            {
+                "status": "success",
+                "robot_id": 0,
+                "target": {"kind": "position"},
+                "target_position": {"x": 0.5, "y": 0.9, "z": 0.0},
+                "start_position": {"x": 0.0, "y": 0.9, "z": 0.0},
+                "goal_position": {"x": 0.5, "y": 0.9, "z": 0.0},
+                "path": [{"x": 0.0, "y": 0.9, "z": 0.0}, {"x": 0.5, "y": 0.9, "z": 0.0}],
+                "actions": [{"action": "MoveAhead"}],
+                "estimated_distance": 0.5,
+                "face_target": False,
+                "face_target_yaw": 0.0,
+                "planner": "reachable_positions_astar",
+                "grid_size": 0.25,
+                "rotate_step_degrees": 90.0,
+                "dynamic_obstacles": [],
+                "blocked_node_count": 0,
+            },
+            {
+                "status": "success",
+                "robot_id": 0,
+                "target": {"kind": "position"},
+                "target_position": {"x": 0.5, "y": 0.9, "z": 0.0},
+                "start_position": {"x": 0.0, "y": 0.9, "z": 0.0},
+                "goal_position": {"x": 0.5, "y": 0.9, "z": 0.0},
+                "path": [{"x": 0.0, "y": 0.9, "z": 0.0}, {"x": 0.0, "y": 0.9, "z": 0.25}, {"x": 0.5, "y": 0.9, "z": 0.25}],
+                "actions": [{"action": "RotateRight"}, {"action": "MoveAhead"}],
+                "estimated_distance": 0.75,
+                "face_target": False,
+                "face_target_yaw": 0.0,
+                "planner": "reachable_positions_astar",
+                "grid_size": 0.25,
+                "rotate_step_degrees": 90.0,
+                "dynamic_obstacles": [{"robot_id": 1}],
+                "blocked_node_count": 1,
+            },
+        ]
+
+        def plan_goto(self, payload, dynamic_obstacles=None):
+            plan_calls.append(dynamic_obstacles)
+            return plans.pop(0)
+
+        def execute_batch(self, actions, default_robot_ref=None, render_image=False, stop_on_failure=True):
+            if len(plan_calls) == 1:
+                return {
+                    "status": "failed",
+                    "results": [
+                        {
+                            "robot_id": 0,
+                            "action": "MoveAhead",
+                            "success": False,
+                            "error": "Agent 1 is blocking Agent 0",
+                        }
+                    ],
+                }
+            return {"status": "success", "results": [{"robot_id": 0, "action": actions[0]["action"], "success": True}]}
+
+        server.plan_goto = MethodType(plan_goto, server)
+        server.execute_batch = MethodType(execute_batch, server)
+
+        result = server.goto({"task_id": "goto-1", "robot_id": 0, "target_position": {"x": 0.5, "z": 0.0}, "execute": True})
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["replan_count"], 1)
+        self.assertEqual(len(result["replan_trace"]), 2)
+        self.assertEqual(plan_calls[0][0]["robot_id"], 1)
+        self.assertEqual(result["execute_result"]["status"], "success")
+
+    def test_goto_fails_after_replan_limit(self) -> None:
+        server = self.fake_server()
+        server.capture_state = MethodType(lambda self, robot_ref=None, render_image=False: {"objects": []}, server)
+
+        def plan_goto(self, payload, dynamic_obstacles=None):
+            return {
+                "status": "success",
+                "robot_id": 0,
+                "target": {"kind": "position"},
+                "target_position": {"x": 0.25, "y": 0.9, "z": 0.0},
+                "start_position": {"x": 0.0, "y": 0.9, "z": 0.0},
+                "goal_position": {"x": 0.25, "y": 0.9, "z": 0.0},
+                "path": [{"x": 0.0, "y": 0.9, "z": 0.0}, {"x": 0.25, "y": 0.9, "z": 0.0}],
+                "actions": [{"action": "MoveAhead"}],
+                "estimated_distance": 0.25,
+                "face_target": False,
+                "face_target_yaw": 0.0,
+                "planner": "reachable_positions_astar",
+                "grid_size": 0.25,
+                "rotate_step_degrees": 90.0,
+                "dynamic_obstacles": [],
+                "blocked_node_count": 0,
+            }
+
+        def execute_batch(self, actions, default_robot_ref=None, render_image=False, stop_on_failure=True):
+            return {
+                "status": "failed",
+                "results": [
+                    {
+                        "robot_id": 0,
+                        "action": "MoveAhead",
+                        "success": False,
+                        "error": "Agent 1 is blocking Agent 0",
+                    }
+                ],
+            }
+
+        server.plan_goto = MethodType(plan_goto, server)
+        server.execute_batch = MethodType(execute_batch, server)
+
+        result = server.goto(
+            {
+                "task_id": "goto-1",
+                "robot_id": 0,
+                "target_position": {"x": 0.25, "z": 0.0},
+                "execute": True,
+                "max_replans": 1,
+            }
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_code"], "execution_failed_after_replans")
+        self.assertEqual(result["replan_count"], 1)
+        self.assertEqual(len(result["replan_trace"]), 2)
+        self.assertIn("blocking", result["failed_action"]["error"])
 
     def test_goto_object_type_not_found(self) -> None:
         server = self.fake_server()
