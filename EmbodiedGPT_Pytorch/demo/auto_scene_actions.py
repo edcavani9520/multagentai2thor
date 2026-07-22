@@ -295,6 +295,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+HTTP_ERROR_BODY_PREVIEW_CHARS = 2000
+
+
+def _json_object_from_response_body(response_body: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(response_body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"HTTP response was not JSON: {response_body[:HTTP_ERROR_BODY_PREVIEW_CHARS]}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("HTTP response JSON must be an object")
+    return parsed
+
+
 def post_json(url: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = Request(
@@ -308,17 +321,18 @@ def post_json(url: str, payload: dict[str, Any], timeout: float) -> dict[str, An
             response_body = response.read().decode("utf-8", errors="replace")
     except HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP POST failed with status {exc.code}: {error_body[:200]}") from exc
+        try:
+            parsed = _json_object_from_response_body(error_body)
+        except RuntimeError as parse_error:
+            raise RuntimeError(
+                f"HTTP POST failed with status {exc.code}: {error_body[:HTTP_ERROR_BODY_PREVIEW_CHARS]}"
+            ) from parse_error
+        parsed["_http_status"] = exc.code
+        return parsed
     except URLError as exc:
         raise RuntimeError(f"HTTP POST failed: {exc.reason}") from exc
 
-    try:
-        parsed = json.loads(response_body)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"HTTP response was not JSON: {response_body[:200]}") from exc
-    if not isinstance(parsed, dict):
-        raise RuntimeError("HTTP response JSON must be an object")
-    return parsed
+    return _json_object_from_response_body(response_body)
 
 
 def get_json(url: str, timeout: float) -> dict[str, Any]:
@@ -422,9 +436,68 @@ def goto_payload_for_navigation_task(args: argparse.Namespace, task_id: str, obj
     return payload
 
 
+def _failed_action_summary(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "index": item.get("index"),
+        "action": item.get("action"),
+        "error": item.get("error"),
+    }
+
+
+def failed_action_from_replan_trace(replan_trace: Any) -> dict[str, Any] | None:
+    if not isinstance(replan_trace, list):
+        return None
+    for trace_item in reversed(replan_trace):
+        if not isinstance(trace_item, dict):
+            continue
+        segments = trace_item.get("segments")
+        if not isinstance(segments, list):
+            continue
+        for segment in reversed(segments):
+            if not isinstance(segment, dict):
+                continue
+            failed_action = segment.get("failed_action")
+            if isinstance(failed_action, dict):
+                return _failed_action_summary(failed_action)
+    return None
+
+
+def summarize_dynamic_obstacles(dynamic_obstacles: Any) -> list[dict[str, Any]]:
+    if not isinstance(dynamic_obstacles, list):
+        return []
+    summary = []
+    for obstacle in dynamic_obstacles[:5]:
+        if not isinstance(obstacle, dict):
+            continue
+        item = {
+            "robot_id": obstacle.get("robot_id"),
+            "name": obstacle.get("name"),
+            "blocked_node_count": obstacle.get("blocked_node_count"),
+        }
+        if isinstance(obstacle.get("nearest_node"), dict):
+            item["nearest_node"] = obstacle["nearest_node"]
+        summary.append(item)
+    return summary
+
+
 def summarize_goto_result(response: dict[str, Any]) -> dict[str, Any]:
     summary: dict[str, Any] = {}
-    for key in ("status", "error_code", "planner", "robot_id", "estimated_distance", "execute"):
+    for key in (
+        "status",
+        "error_code",
+        "error",
+        "replan_error_code",
+        "replan_error",
+        "replan_count",
+        "_http_status",
+        "planner",
+        "robot_id",
+        "estimated_distance",
+        "execute",
+        "blocked_node_count",
+        "avoid_other_robots",
+        "executed_action_count",
+    ):
         if key in response:
             summary[key] = response[key]
     actions = response.get("actions")
@@ -436,23 +509,57 @@ def summarize_goto_result(response: dict[str, Any]) -> dict[str, Any]:
     for key in ("target", "target_position", "goal_position", "start_position"):
         if isinstance(response.get(key), dict):
             summary[key] = response[key]
+
+    failed_action = response.get("failed_action")
+    if isinstance(failed_action, dict):
+        summary["failed_action"] = _failed_action_summary(failed_action)
+
     execute_result = response.get("execute_result")
     if isinstance(execute_result, dict):
         summary["execute_result_status"] = execute_result.get("status")
         results = execute_result.get("results")
         if isinstance(results, list):
             summary["execute_result_count"] = len(results)
-            for item in results:
-                if isinstance(item, dict) and item.get("success") is False:
-                    summary["failed_action"] = {
-                        "index": item.get("index"),
-                        "action": item.get("action"),
-                        "error": item.get("error"),
-                    }
-                    break
-    if response.get("error") is not None:
-        summary["error"] = response.get("error")
+            if "failed_action" not in summary:
+                for item in results:
+                    if isinstance(item, dict) and item.get("success") is False:
+                        summary["failed_action"] = _failed_action_summary(item)
+                        break
+
+    if "failed_action" not in summary:
+        failed_from_trace = failed_action_from_replan_trace(response.get("replan_trace"))
+        if failed_from_trace is not None:
+            summary["failed_action"] = failed_from_trace
+    if isinstance(response.get("replan_trace"), list):
+        summary["replan_trace_count"] = len(response["replan_trace"])
+
+    dynamic_obstacles = summarize_dynamic_obstacles(response.get("dynamic_obstacles"))
+    if dynamic_obstacles:
+        summary["dynamic_obstacles"] = dynamic_obstacles
+        summary["dynamic_obstacle_count"] = len(response.get("dynamic_obstacles", []))
     return summary
+
+
+def goto_failure_reason(response: dict[str, Any], summary: dict[str, Any]) -> str:
+    status = response.get("status")
+    error_code = response.get("error_code") or status or "goto_failed"
+    error = response.get("error") or response.get("reason") or f"/goto returned status {status!r}"
+    pieces = [f"{error_code}: {error}"]
+    replan_error_code = response.get("replan_error_code")
+    replan_error = response.get("replan_error")
+    if replan_error_code or replan_error:
+        pieces.append(f"replan={replan_error_code or 'unknown'}: {replan_error or 'unknown error'}")
+    failed_action = summary.get("failed_action")
+    if isinstance(failed_action, dict):
+        action = failed_action.get("action")
+        action_error = failed_action.get("error")
+        if action or action_error:
+            pieces.append(f"failed_action={action or 'unknown'}; error={action_error or 'unknown error'}")
+    if summary.get("replan_count") is not None:
+        pieces.append(f"replans={summary.get('replan_count')}")
+    if summary.get("dynamic_obstacle_count") is not None:
+        pieces.append(f"dynamic_obstacles={summary.get('dynamic_obstacle_count')}")
+    return "; ".join(pieces)
 
 
 def navigation_goto_result(
@@ -481,7 +588,7 @@ def navigation_goto_result(
             file=sys.stderr,
         )
     else:
-        reason = goto_response.get("error") or goto_response.get("reason") or f"/goto returned status {status!r}"
+        reason = goto_failure_reason(goto_response, summary)
         closed_loop_result = {
             "status": "needs_upstream_planning",
             "strategy": "goto",

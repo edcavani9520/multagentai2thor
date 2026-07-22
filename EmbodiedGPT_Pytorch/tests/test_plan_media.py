@@ -1660,6 +1660,73 @@ class ObjectVisibilityMapTest(unittest.TestCase):
             "http://host:19000/goto",
         )
 
+    def test_post_json_returns_json_body_for_http_error(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {
+                        "status": "failed",
+                        "error_code": "no_path",
+                        "error": "no path between start and goal",
+                    }
+                ).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args) -> None:  # noqa: A003
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            response = auto_scene_actions_module.post_json(
+                f"http://127.0.0.1:{server.server_port}/goto",
+                {"execute": True},
+                5,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(response["status"], "failed")
+        self.assertEqual(response["error_code"], "no_path")
+        self.assertEqual(response["_http_status"], 400)
+
+    def test_goto_summary_extracts_replan_trace_failed_action(self) -> None:
+        summary = auto_scene_actions_module.summarize_goto_result(
+            {
+                "status": "failed",
+                "error_code": "execution_failed_after_replans",
+                "error": "navigation action execution failed after replanning",
+                "replan_count": 3,
+                "replan_trace": [
+                    {
+                        "dynamic_obstacles": [{"robot_id": 0, "blocked_node_count": 2}],
+                        "segments": [
+                            {
+                                "failed_action": {
+                                    "index": 6,
+                                    "action": "MoveAhead",
+                                    "error": "Agent 0 is blocking Agent 1",
+                                }
+                            }
+                        ],
+                    }
+                ],
+                "dynamic_obstacles": [{"robot_id": 0, "name": "Robot0", "blocked_node_count": 2}],
+            }
+        )
+
+        self.assertEqual(summary["failed_action"]["action"], "MoveAhead")
+        self.assertIn("blocking", summary["failed_action"]["error"])
+        self.assertEqual(summary["replan_count"], 3)
+        self.assertEqual(summary["dynamic_obstacle_count"], 1)
+
     def test_navigation_only_run_calls_goto_without_qwen(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             probe = {
@@ -1748,6 +1815,92 @@ class ObjectVisibilityMapTest(unittest.TestCase):
         self.assertEqual(output["task_intent_source"], "navigation_goto_intent")
         self.assertEqual(output["closed_loop_result"], {"status": "success", "strategy": "goto"})
         self.assertEqual(output["goto_result_summary"]["action_count"], 1)
+
+    def test_navigation_only_goto_failure_outputs_clear_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 1,
+                "robots": [{"robot_id": 0}, {"robot_id": 1}],
+                "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": True}],
+                "image_base64": "eA==",
+                "results": [{"robot_id": 1, "image_base64": "eA=="}],
+                "state": {
+                    "sceneName": "FloorPlan1",
+                    "selected_robot_id": 1,
+                    "robots": [{"robot_id": 0}, {"robot_id": 1}],
+                    "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": True}],
+                },
+            }
+            old_probe = auto_scene_actions_module.probe_scene
+            old_post_json = auto_scene_actions_module.post_json
+            old_generate_intent = auto_scene_actions_module.generate_task_intent_tool_call
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+
+            def fake_post_json(url, payload, timeout):
+                return {
+                    "_http_status": 400,
+                    "status": "failed",
+                    "error_code": "execution_failed_after_replans",
+                    "error": "navigation action execution failed after replanning",
+                    "replan_count": 3,
+                    "replan_trace": [
+                        {
+                            "segments": [
+                                {
+                                    "failed_action": {
+                                        "index": 30,
+                                        "action": "MoveAhead",
+                                        "error": "Agent 0 is blocking Agent 1",
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    "dynamic_obstacles": [{"robot_id": 0, "name": "Robot0", "blocked_node_count": 4}],
+                    "execute_result": {"status": "partial", "results": []},
+                }
+
+            auto_scene_actions_module.post_json = fake_post_json
+            auto_scene_actions_module.generate_task_intent_tool_call = lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("navigation-only task must not call Qwen intent extraction")
+            )
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:19000/execute_actions",
+                        "--task",
+                        "go to the fridge.",
+                        "--task-id",
+                        "goto-task-failed",
+                        "--primary-robot-id",
+                        "1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--closed-loop-replan",
+                    ]
+                )
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.post_json = old_post_json
+                auto_scene_actions_module.generate_task_intent_tool_call = old_generate_intent
+
+        output = json.loads(stdout.getvalue())
+        reason = output["closed_loop_result"]["reason"]
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(output["closed_loop_result"]["failure_code"], "execution_failed_after_replans")
+        self.assertIn("execution_failed_after_replans", reason)
+        self.assertIn("MoveAhead", reason)
+        self.assertIn("Agent 0 is blocking Agent 1", reason)
+        self.assertEqual(output["goto_result_summary"]["_http_status"], 400)
+        self.assertEqual(output["goto_result_summary"]["failed_action"]["action"], "MoveAhead")
+        self.assertIn("[goto] failed: execution_failed_after_replans", stderr.getvalue())
 
     def test_probe_scene_uses_execute_actions_pass_with_primary_robot_id(self) -> None:
         captured: dict[str, object] = {}
