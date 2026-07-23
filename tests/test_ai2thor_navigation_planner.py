@@ -470,6 +470,25 @@ class NavigationReceiverMethodTest(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["error_code"], "target_not_found")
 
+    def test_handler_health_reports_service_without_controller_ready_check(self) -> None:
+        class FakeThor:
+            robots = [object(), object()]
+
+        fake = FakeThor()
+        original = module.thor_instance
+        module.thor_instance = fake
+        try:
+            handler = NativeControllerReceiverHandler.__new__(NativeControllerReceiverHandler)
+            handler.path = "/health"
+            sent = []
+            handler._send_json = MethodType(lambda self, code, payload: sent.append((code, payload)), handler)
+
+            handler.do_GET()
+        finally:
+            module.thor_instance = original
+
+        self.assertEqual(sent, [(200, {"status": "ok", "service": "ai2thor_receiver_server", "robots": 2})])
+
     def test_handler_goto_dispatches_to_thor_instance(self) -> None:
         class FakeThor:
             controller = object()

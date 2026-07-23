@@ -1421,7 +1421,7 @@ class NativeControllerReceiverHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         log_event("REMOTE IN", f"GET {self.path}")
-        if parsed.path == "/":
+        if parsed.path in {"/", "/health"}:
             self._send_json(200, {"status": "ok", "service": "ai2thor_receiver_server", "robots": len(thor_instance.robots) if thor_instance else 0})
         elif parsed.path == "/robots":
             if not self._controller_ready():
