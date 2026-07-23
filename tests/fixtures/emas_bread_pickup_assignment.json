@@ -1,0 +1,15 @@
+{
+  "task": "pick up the bread",
+  "assignments": [
+    {
+      "agent_id": "0",
+      "subtask": {
+        "id": "T1",
+        "name": "Pick up the bread",
+        "description": "Pick up the bread.",
+        "action": "pick",
+        "depends_on": []
+      }
+    }
+  ]
+}

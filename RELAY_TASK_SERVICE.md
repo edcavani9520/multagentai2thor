@@ -104,4 +104,36 @@ complete the task returns `status: "needs_upstream_planning"` with a structured
 reason; HTTP `4xx` and `5xx` are reserved for malformed requests and runtime
 failures.
 
+## EMAS bridge
+
+`emas_relay_bridge.py` connects EMAS's planning/allocation output to this
+service. It accepts an EMAS allocation plan, one allocation unit, or the
+`communication_outbox.json` produced by the hybrid loop. Each
+`{agent_id, subtask}` is sent to `/execute_task`; the output is an EMAS adapter
+report containing `task_statuses` and `execution`.
+
+```bash
+python emas_relay_bridge.py \
+  --assignments-json /path/to/communication_outbox.json \
+  --task "put the bread on the countertop" \
+  --relay-url http://127.0.0.1:18080 \
+  --known-robot-ids 0,1 \
+  --output /tmp/emas_relay_report.json
+```
+
+For a no-mutation protocol check, add `--dry-run --relay-strategy rules`.
+The bridge is intentionally a process boundary for now: set EMAS's file
+adapter result path to the generated report, or replace its file adapter with
+`dispatch_assignments` when promoting this experiment into the EMAS tree.
+
+To smoke-test the actual EMAS decomposition and allocation functions against
+the current receiver scene, without constructing a full ConceptGraph, run:
+
+```bash
+python emas_relay_smoke.py \
+  --task "open the fridge" \
+  --dry-run \
+  --output /tmp/emas_relay_smoke.json
+```
+
 For the complete relay decision model, see `relay_closed_loop_design_cn.md`.

@@ -1,0 +1,15 @@
+{
+  "task": "open the fridge",
+  "assignments": [
+    {
+      "agent_id": "0",
+      "subtask": {
+        "id": "T1",
+        "name": "Open the fridge",
+        "description": "Open the fridge.",
+        "action": "open",
+        "depends_on": []
+      }
+    }
+  ]
+}
