@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE_DIR="${BASE_DIR:-/225010231/mwl/Linhao}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="${BASE_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+EMBODIED_ROOT="${EMBODIED_ROOT:-$SCRIPT_DIR}"
 CONDA_ENV="${CONDA_ENV:-qwen35}"
 SEND_ACTIONS_URL="${SEND_ACTIONS_URL:-http://127.0.0.1:19001/execute_actions}"
 QWEN_MODEL="${QWEN_MODEL:-$BASE_DIR/models/Qwen3.5-4B}"
@@ -11,7 +13,7 @@ QWEN_DTYPE="${QWEN_DTYPE:-bfloat16}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
 TEMPERATURE="${TEMPERATURE:-0.2}"
 
-cd "$BASE_DIR/EmbodiedGPT_Pytorch"
+cd "$EMBODIED_ROOT"
 
 if command -v conda >/dev/null 2>&1; then
   # shellcheck disable=SC1090
