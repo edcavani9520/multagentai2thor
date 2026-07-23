@@ -117,6 +117,34 @@ python -m unittest tests/test_relay_agent_integration.py tests/test_relay_agent_
 
 任务 API 见 [RELAY_TASK_SERVICE.md](RELAY_TASK_SERVICE.md)，relay 闭环设计见 [relay_closed_loop_design_cn.md](relay_closed_loop_design_cn.md)。AI2-THOR HTTP 接口和项目架构见 [PROJECT_ARCHITECTURE_DRAFT.md](PROJECT_ARCHITECTURE_DRAFT.md)。
 
+## ProcTHOR 场景烟测
+
+`procthor_benchmark.py` 独立于 HTTP receiver，用于验证 ProcTHOR house JSON 能否加载、传送、查询可达位置、执行一步移动并返回图像。它不会占用 `18080` 或 `19000` 端口：
+
+```bash
+python procthor_benchmark.py \
+  --scene-json /home/kinova-1/procthor-10k/house_0001.json \
+  --local-executable-path /home/kinova-1/.ai2thor/releases/thor-Linux64-f0825767cd50d69f666c7f282e54abfe58f1e917/thor-Linux64-f0825767cd50d69f666c7f282e54abfe58f1e917 \
+  --x-display :1 \
+  --output-dir /tmp/procthor_benchmark_run
+```
+
+结果会写入输出目录的 `summary.json` 和渲染帧。传入包含多个 `.json` 或 `.json.gz` 文件的目录即可进行批量烟测；这还不是标准 ObjectNav evaluator。
+
+### 生成固定 ProcTHOR 测试集
+
+`generate_procthor_dataset.py` 使用安装的官方 ProcTHOR `HouseGenerator` 和 `PROCTHOR10K_ROOM_SPEC_SAMPLER`。它按固定 seed 生成场景、转换为当前本地 Unity build 可加载的 schema、验证起点和可达位置，并将结果记录到 `manifest.json`：
+
+```bash
+python generate_procthor_dataset.py \
+  --output-dir /home/kinova-1/procthor-10k/generated \
+  --split train --start-seed 0 --count 20 \
+  --local-executable-path /home/kinova-1/.ai2thor/releases/thor-Linux64-f0825767cd50d69f666c7f282e54abfe58f1e917/thor-Linux64-f0825767cd50d69f666c7f282e54abfe58f1e917 \
+  --x-display :1
+```
+
+重复同一命令会保留已有场景；可用新的 `--start-seed` 和 `--count` 断点续跑。默认跳过当前 build 不兼容的小物体生成阶段，因此该测试集适合导航、场景理解和 relay 验证，而不是完整官方 ObjectNav 对比。
+
 ## 文件状态
 
 完整文件分层与保留状态见 [PROJECT_FILE_MAP.md](PROJECT_FILE_MAP.md)。
