@@ -1,0 +1,1 @@
+{"status": "failed", "task_id": "unknown", "error_code": "invalid_target", "error": "provide target_position, object_id, or object_type"}

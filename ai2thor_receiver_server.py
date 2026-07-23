@@ -377,6 +377,7 @@ class NativeControllerThorServer:
         robot0_dz: float = 0.0,
         robot0_left: float = 0.0,
         robot0_right: float = 0.0,
+        robot0_back: float = 0.0,
         robot0_dyaw: float = 0.0,
         robot0_at_fridge: bool = False,
         robot0_fridge_distance: float = 1.0,
@@ -390,6 +391,7 @@ class NativeControllerThorServer:
         self.robot0_dz = robot0_dz
         self.robot0_left = robot0_left
         self.robot0_right = robot0_right
+        self.robot0_back = robot0_back
         self.robot0_dyaw = robot0_dyaw
         self.robot0_at_fridge = robot0_at_fridge
         self.robot0_fridge_distance = robot0_fridge_distance
@@ -1227,21 +1229,25 @@ class NativeControllerThorServer:
         return adjusted
 
     def _apply_robot0_initial_offset(self, pos: dict, yaw: float) -> tuple[dict, float]:
-        if not any((self.robot0_dx, self.robot0_dz, self.robot0_left, self.robot0_right, self.robot0_dyaw)):
+        if not any((self.robot0_dx, self.robot0_dz, self.robot0_left, self.robot0_right, self.robot0_back, self.robot0_dyaw)):
             return pos, yaw
         adjusted = dict(pos)
         adjusted["x"] += self.robot0_dx
         adjusted["z"] += self.robot0_dz
+        yaw_rad = math.radians(yaw)
         lateral = self.robot0_left - self.robot0_right
         if lateral:
-            yaw_rad = math.radians(yaw)
             adjusted["x"] += lateral * math.cos(yaw_rad)
             adjusted["z"] += lateral * math.sin(yaw_rad)
+        if self.robot0_back:
+            adjusted["x"] -= self.robot0_back * math.sin(yaw_rad)
+            adjusted["z"] -= self.robot0_back * math.cos(yaw_rad)
         adjusted_yaw = yaw + self.robot0_dyaw
         log_event(
             "SIM IN",
             f"Apply Robot0 initial offset: dx={self.robot0_dx:.2f}, dz={self.robot0_dz:.2f}, "
-            f"left={self.robot0_left:.2f}, right={self.robot0_right:.2f}, dyaw={self.robot0_dyaw:.1f}",
+            f"left={self.robot0_left:.2f}, right={self.robot0_right:.2f}, back={self.robot0_back:.2f}, "
+            f"dyaw={self.robot0_dyaw:.1f}",
         )
         return adjusted, adjusted_yaw
 
@@ -1603,6 +1609,7 @@ def main():
     parser.add_argument("--robot0-dz", type=float, default=0.0)
     parser.add_argument("--robot0-left", type=float, default=0.0)
     parser.add_argument("--robot0-right", type=float, default=0.0)
+    parser.add_argument("--robot0-back", type=float, default=0.0)
     parser.add_argument("--robot0-dyaw", type=float, default=0.0)
     parser.add_argument("--robot0-at-fridge", action="store_true")
     parser.add_argument("--robot0-fridge-distance", type=float, default=1.0)
@@ -1618,6 +1625,7 @@ def main():
         robot0_dz=args.robot0_dz,
         robot0_left=args.robot0_left,
         robot0_right=args.robot0_right,
+        robot0_back=args.robot0_back,
         robot0_dyaw=args.robot0_dyaw,
         robot0_at_fridge=args.robot0_at_fridge,
         robot0_fridge_distance=args.robot0_fridge_distance,
