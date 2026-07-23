@@ -654,7 +654,7 @@ class NativeControllerThorServer:
             status = "partial"
         else:
             status = "failed"
-        return {"status": status, "results": results, "state": self.capture_state(last_robot_ref)}
+        return {"status": status, "results": results, "state": self._safe_capture_state(last_robot_ref)}
 
     def capture_state(self, robot_ref=None, render_image: bool = False) -> dict:
         with self.lock:
@@ -684,8 +684,23 @@ class NativeControllerThorServer:
                     state["image_base64"] = image_b64
             return state
 
+    def _safe_capture_state(self, robot_ref=None, render_image: bool = False) -> dict:
+        try:
+            return self.capture_state(robot_ref, render_image=render_image)
+        except Exception as exc:
+            log_event(
+                "SIM OUT",
+                f"WARNING capture_state failed: {type(exc).__name__}: {exc}",
+            )
+            return {
+                "status": "unavailable",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+
     def _controller_step(self, action: dict):
-        return self.controller.step(action)
+        with self.lock:
+            return self.controller.step(action)
 
     @staticmethod
     def _events_from(event):
@@ -1018,6 +1033,7 @@ class NativeControllerThorServer:
         task_id = payload.get("task_id", "unknown") if isinstance(payload, dict) else "unknown"
         execute = bool(payload.get("execute", False)) if isinstance(payload, dict) else False
         avoid_other_robots = bool(payload.get("avoid_other_robots", True)) if isinstance(payload, dict) else True
+        robot_ref = payload.get("robot_id", payload.get("robot", payload.get("agent_id"))) if isinstance(payload, dict) else None
         try:
             if execute:
                 plan = self._plan_goto_with_dynamic_obstacles(payload, avoid_other_robots=avoid_other_robots)
@@ -1096,7 +1112,7 @@ class NativeControllerThorServer:
                     "execute_result": {
                         "status": "success",
                         "results": all_results,
-                        "state": self.capture_state(plan["robot_id"]),
+                        "state": self._safe_capture_state(plan.get("robot_id", robot_ref)),
                     },
                     "replan_count": replan_count,
                     "replan_trace": replan_trace,
@@ -1112,7 +1128,7 @@ class NativeControllerThorServer:
                     "execute_result": {
                         "status": self._execution_status(all_results, expected_action_count),
                         "results": all_results,
-                        "state": self.capture_state(plan["robot_id"]),
+                        "state": self._safe_capture_state(plan.get("robot_id", robot_ref)),
                     },
                     "replan_count": replan_count,
                     "replan_trace": replan_trace,
@@ -1135,7 +1151,7 @@ class NativeControllerThorServer:
                     "execute_result": {
                         "status": self._execution_status(all_results, expected_action_count),
                         "results": all_results,
-                        "state": self.capture_state(plan["robot_id"]),
+                        "state": self._safe_capture_state(plan.get("robot_id", robot_ref)),
                     },
                     "replan_count": replan_count,
                     "replan_trace": replan_trace,
@@ -1281,19 +1297,27 @@ class NativeControllerThorServer:
         delay_ms = max(1, int(1000 / max(0.1, fps)))
         try:
             while True:
-                with self.lock:
-                    event = self._controller_step({"action": "Pass", "agentId": 0, "renderImage": True})
-                    self._refresh_all_robot_states(event)
-                    events = self._events_from(event)
-                    for robot in self.robots:
-                        if robot.robot_id >= len(events):
-                            continue
-                        img = self._event_bgr_image(events[robot.robot_id])
-                        if img is None:
-                            continue
-                        img = img.copy()
-                        self._draw_overlay(img, robot)
-                        cv2.imshow(self._window_names[robot.robot_id], img)
+                try:
+                    with self.lock:
+                        event = self._controller_step({"action": "Pass", "agentId": 0, "renderImage": True})
+                        self._refresh_all_robot_states(event)
+                        events = self._events_from(event)
+                        for robot in self.robots:
+                            if robot.robot_id >= len(events):
+                                continue
+                            img = self._event_bgr_image(events[robot.robot_id])
+                            if img is None:
+                                continue
+                            img = img.copy()
+                            self._draw_overlay(img, robot)
+                            cv2.imshow(self._window_names[robot.robot_id], img)
+                except Exception as exc:
+                    log_event(
+                        "LOCAL OUT",
+                        f"Display loop stopped after controller error: {type(exc).__name__}: {exc}",
+                    )
+                    traceback.print_exc()
+                    return False
                 key = cv2.waitKey(delay_ms) & 0xFF
                 if key in (ord("q"), 27):
                     log_event("LOCAL IN", "GUI quit requested")
@@ -1527,7 +1551,22 @@ class NativeControllerReceiverHandler(BaseHTTPRequestHandler):
             f"POST /goto task_id={task_id}, robot={robot_ref}, execute={execute}",
             blank_before=True,
         )
-        result = thor_instance.goto(payload)
+        try:
+            result = thor_instance.goto(payload)
+        except Exception as exc:
+            log_event("REMOTE OUT", f"POST /goto receiver exception: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+            self._send_json(
+                500,
+                {
+                    "status": "failed",
+                    "task_id": task_id,
+                    "error_code": "receiver_exception",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            return
         log_event(
             "REMOTE OUT",
             f"POST /goto status={result.get('status')} actions={len(result.get('actions', []))}",

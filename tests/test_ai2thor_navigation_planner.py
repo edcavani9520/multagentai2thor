@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import threading
 from types import MethodType
 
 import ai2thor_receiver_server as module
@@ -125,6 +126,7 @@ class NavigationPlannerPureFunctionTest(unittest.TestCase):
 class NavigationReceiverMethodTest(unittest.TestCase):
     def fake_server(self, *, yaw: float = 0.0) -> NativeControllerThorServer:
         server = NativeControllerThorServer.__new__(NativeControllerThorServer)
+        server.lock = threading.RLock()
         server.robots = [
             RobotState(
                 robot_id=0,
@@ -460,6 +462,151 @@ class NavigationReceiverMethodTest(unittest.TestCase):
         self.assertEqual(len(result["replan_trace"]), 2)
         self.assertIn("blocking", result["failed_action"]["error"])
 
+    def test_goto_replan_failure_survives_broken_capture_state(self) -> None:
+        server = self.fake_server()
+        plan_calls = 0
+
+        def plan_goto(self, payload, dynamic_obstacles=None):
+            nonlocal plan_calls
+            plan_calls += 1
+            if plan_calls > 1:
+                raise module.NavigationPlanningError(
+                    "no_reachable_positions",
+                    "GetReachablePositions returned no usable positions",
+                )
+            return {
+                "status": "success",
+                "robot_id": 0,
+                "target": {"kind": "position"},
+                "target_position": {"x": 0.25, "y": 0.9, "z": 0.0},
+                "start_position": {"x": 0.0, "y": 0.9, "z": 0.0},
+                "goal_position": {"x": 0.25, "y": 0.9, "z": 0.0},
+                "path": [{"x": 0.0, "y": 0.9, "z": 0.0}, {"x": 0.25, "y": 0.9, "z": 0.0}],
+                "actions": [{"action": "MoveAhead"}],
+                "estimated_distance": 0.25,
+                "face_target": False,
+                "face_target_yaw": 0.0,
+                "planner": "reachable_positions_astar",
+                "grid_size": 0.25,
+                "rotate_step_degrees": 90.0,
+                "dynamic_obstacles": [],
+                "blocked_node_count": 0,
+            }
+
+        def execute_batch(self, actions, default_robot_ref=None, render_image=False, stop_on_failure=True):
+            return {
+                "status": "failed",
+                "results": [
+                    {
+                        "robot_id": 0,
+                        "action": "MoveAhead",
+                        "success": False,
+                        "error": "Agent 1 is blocking Agent 0",
+                    }
+                ],
+            }
+
+        def capture_state(self, robot_ref=None, render_image=False):
+            raise ValueError("write to closed file")
+
+        server.plan_goto = MethodType(plan_goto, server)
+        server.execute_batch = MethodType(execute_batch, server)
+        server.capture_state = MethodType(capture_state, server)
+
+        result = server.goto(
+            {
+                "task_id": "goto-1",
+                "robot_id": 0,
+                "target_position": {"x": 0.25, "z": 0.0},
+                "execute": True,
+            }
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_code"], "execution_failed_after_replans")
+        self.assertEqual(result["replan_error_code"], "no_reachable_positions")
+        self.assertEqual(result["execute_result"]["state"]["status"], "unavailable")
+        self.assertEqual(result["execute_result"]["state"]["error_type"], "ValueError")
+
+    def test_execute_batch_uses_safe_capture_state(self) -> None:
+        server = self.fake_server()
+
+        def execute(self, robot_ref, action, render_image=False, **kwargs):
+            return {
+                "robot_id": robot_ref,
+                "action": action,
+                "success": True,
+                "error": None,
+            }
+
+        def capture_state(self, robot_ref=None, render_image=False):
+            raise RuntimeError("controller pipe closed")
+
+        server.execute = MethodType(execute, server)
+        server.capture_state = MethodType(capture_state, server)
+
+        result = server.execute_batch([{"action": "MoveAhead"}], default_robot_ref=0)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["state"]["status"], "unavailable")
+        self.assertEqual(result["state"]["error_type"], "RuntimeError")
+
+    def test_controller_step_is_serialized(self) -> None:
+        server = self.fake_server()
+        entered_first = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+        order: list[str] = []
+        active = 0
+        max_active = 0
+        guard = threading.Lock()
+
+        class FakeController:
+            def step(self, action):
+                nonlocal active, max_active
+                with guard:
+                    active += 1
+                    max_active = max(max_active, active)
+                    order.append(action["action"])
+                if action["action"] == "first":
+                    entered_first.set()
+                    release_first.wait(timeout=2.0)
+                else:
+                    second_entered.set()
+                with guard:
+                    active -= 1
+                return {"action": action["action"]}
+
+        server.controller = FakeController()
+
+        first_result = {}
+        second_result = {}
+
+        def run_first() -> None:
+            first_result["value"] = server._controller_step({"action": "first"})
+
+        def run_second() -> None:
+            second_result["value"] = server._controller_step({"action": "second"})
+
+        t1 = threading.Thread(target=run_first)
+        t2 = threading.Thread(target=run_second)
+        t1.start()
+        self.assertTrue(entered_first.wait(timeout=2.0))
+        t2.start()
+        self.assertFalse(second_entered.wait(timeout=0.2))
+        self.assertEqual(order, ["first"])
+        self.assertEqual(max_active, 1)
+        release_first.set()
+        t1.join(timeout=2.0)
+        t2.join(timeout=2.0)
+
+        self.assertFalse(t1.is_alive())
+        self.assertFalse(t2.is_alive())
+        self.assertEqual(order, ["first", "second"])
+        self.assertEqual(max_active, 1)
+        self.assertEqual(first_result["value"], {"action": "first"})
+        self.assertEqual(second_result["value"], {"action": "second"})
+
     def test_goto_object_type_not_found(self) -> None:
         server = self.fake_server()
         server.capture_state = MethodType(lambda self, robot_ref=None, render_image=False: {"objects": []}, server)
@@ -513,6 +660,34 @@ class NavigationReceiverMethodTest(unittest.TestCase):
 
         self.assertEqual(sent, [(200, {"status": "success", "actions": [{"action": "MoveAhead"}]})])
         self.assertEqual(fake.payload, {"task_id": "goto-1", "execute": False})
+
+    def test_handler_goto_returns_json_for_receiver_exception(self) -> None:
+        class FakeThor:
+            controller = object()
+
+            def goto(self, payload):
+                raise RuntimeError("controller pipe closed")
+
+        fake = FakeThor()
+        original = module.thor_instance
+        module.thor_instance = fake
+        try:
+            handler = NativeControllerReceiverHandler.__new__(NativeControllerReceiverHandler)
+            handler._controller_ready = MethodType(lambda self: True, handler)
+            handler._read_json = MethodType(lambda self: {"task_id": "goto-1", "execute": True}, handler)
+            sent = []
+            handler._send_json = MethodType(lambda self, code, payload: sent.append((code, payload)), handler)
+
+            handler._handle_goto()
+        finally:
+            module.thor_instance = original
+
+        self.assertEqual(sent[0][0], 500)
+        self.assertEqual(sent[0][1]["status"], "failed")
+        self.assertEqual(sent[0][1]["task_id"], "goto-1")
+        self.assertEqual(sent[0][1]["error_code"], "receiver_exception")
+        self.assertEqual(sent[0][1]["error_type"], "RuntimeError")
+        self.assertIn("controller pipe closed", sent[0][1]["error"])
 
 
 if __name__ == "__main__":
