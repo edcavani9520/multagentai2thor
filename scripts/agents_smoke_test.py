@@ -151,7 +151,10 @@ def check_receiver(base_url: str, robot_id: int, target: str, timeout: float) ->
                 ok = ok and data.get("status") in {"success", "partial"}
             if name == "goto_dry_run":
                 ok = ok and data.get("status") in {"success", "failed"}
-            print_check(name, ok, f"HTTP {status}; {summarize_endpoint_response(data)}")
+            detail = f"HTTP {status}; {summarize_endpoint_response(data)}"
+            if name == "health" and not ok and status == 404:
+                detail += "; receiver is probably running older code, restart ai2thor_receiver_server.py"
+            print_check(name, ok, detail)
         except Exception as exc:
             ok = False
             print_check(name, False, str(exc))

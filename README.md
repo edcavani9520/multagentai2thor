@@ -113,6 +113,8 @@ python -m unittest tests/test_relay_agent.py
 python -m unittest tests/test_relay_agent_integration.py tests/test_relay_agent_closed_loop.py
 ```
 
+任务测试表见 [AGENTS_TASK_TEST_MATRIX.md](AGENTS_TASK_TEST_MATRIX.md)。
+
 任务 API 见 [RELAY_TASK_SERVICE.md](RELAY_TASK_SERVICE.md)，relay 闭环设计见 [relay_closed_loop_design_cn.md](relay_closed_loop_design_cn.md)。AI2-THOR HTTP 接口和项目架构见 [PROJECT_ARCHITECTURE_DRAFT.md](PROJECT_ARCHITECTURE_DRAFT.md)。
 
 ## 文件状态
