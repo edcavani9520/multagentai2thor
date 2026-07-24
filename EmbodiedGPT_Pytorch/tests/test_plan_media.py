@@ -1849,6 +1849,93 @@ class ObjectVisibilityMapTest(unittest.TestCase):
         self.assertEqual(output["closed_loop_result"], {"status": "success", "strategy": "goto"})
         self.assertEqual(output["goto_result_summary"]["action_count"], 1)
 
+
+    def test_external_goto_intent_calls_goto_without_semantic_planning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 0,
+                "robots": [{"robot_id": 0}, {"robot_id": 1}],
+                "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": True}],
+                "image_base64": "eA==",
+                "results": [{"robot_id": 0, "image_base64": "eA=="}],
+                "state": {
+                    "sceneName": "FloorPlan1",
+                    "selected_robot_id": 0,
+                    "robots": [{"robot_id": 0}, {"robot_id": 1}],
+                    "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": True}],
+                },
+            }
+            captured: dict[str, object] = {}
+            old_probe = auto_scene_actions_module.probe_scene
+            old_post_json = auto_scene_actions_module.post_json
+            old_generate_plan = auto_scene_actions_module.generate_semantic_plan
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+
+            def fake_post_json(url, payload, timeout):
+                captured["url"] = url
+                captured["payload"] = payload
+                return {
+                    "status": "success",
+                    "robot_id": payload["robot_id"],
+                    "planner": "reachable_positions_astar",
+                    "actions": [{"action": "MoveAhead"}],
+                    "execute": payload["execute"],
+                    "goal_position": {"x": 0.0, "y": 0.9, "z": 1.0},
+                    "execute_result": {"status": "success", "results": []},
+                }
+
+            auto_scene_actions_module.post_json = fake_post_json
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("external GotoObject intent must use /goto, not semantic planning")
+            )
+            try:
+                task_intent_json = json.dumps(
+                    {
+                        "task_intent_source": "qwen_normalizer_tool_call",
+                        "task_intent": {
+                            "requestedAction": "GotoObject",
+                            "requestedObjectType": "Fridge",
+                            "requestedTargetType": None,
+                            "intentSteps": [
+                                {"order": 1, "action": "GotoObject", "objectType": "Fridge", "targetType": None}
+                            ],
+                        },
+                    }
+                )
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:19000/execute_actions",
+                        "--task",
+                        "Search the environment for the Fridge",
+                        "--task-id",
+                        "external-goto-task-1",
+                        "--task-intent-json",
+                        task_intent_json,
+                        "--primary-robot-id",
+                        "0",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--closed-loop-replan",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.post_json = old_post_json
+                auto_scene_actions_module.generate_semantic_plan = old_generate_plan
+
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured["url"], "http://127.0.0.1:19000/goto")
+        self.assertEqual(captured["payload"]["object_type"], "Fridge")
+        self.assertEqual(output["task_intent_source"], "qwen_normalizer_tool_call")
+        self.assertEqual(output["closed_loop_result"], {"status": "success", "strategy": "goto"})
+
     def test_navigation_only_goto_failure_outputs_clear_reason(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             probe = {

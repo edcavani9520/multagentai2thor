@@ -4852,6 +4852,31 @@ def run(args: argparse.Namespace) -> int:
             args,
             object_categories(objects, visible_only=False),
         )
+        upstream_navigation_step = primary_intent_step(intent_steps(task_intent))
+        if (
+            upstream_navigation_step is not None
+            and upstream_navigation_step.get("action") == "GotoObject"
+            and isinstance(upstream_navigation_step.get("objectType"), str)
+            and upstream_navigation_step.get("objectType").strip()
+        ):
+            result = navigation_goto_result(
+                args,
+                task_id=task_id,
+                base_url=base_url,
+                probe=probe,
+                primary_observation=primary_observation,
+                image_path=image_path,
+                object_type=upstream_navigation_step["objectType"],
+            )
+            result["task_intent_source"] = task_intent_source_for_args(args)
+            result["task_intent_tool_call"] = task_intent_tool_call
+            result["task_intent_tool_call_validation"] = task_intent_tool_call_validation
+            metadata = getattr(args, "_task_normalization", None)
+            if isinstance(metadata, dict):
+                result["task_normalization"] = metadata
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+
         intent_expansion_warnings: list[str] = []
         if not (args.relay_mode and args.closed_loop_replan):
             intent_expansion_warnings = expand_put_object_intent_preconditions(task_intent, primary_observation)
