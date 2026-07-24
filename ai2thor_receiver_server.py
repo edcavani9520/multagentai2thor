@@ -1502,6 +1502,48 @@ class NativeControllerReceiverHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         return json.loads(body.decode("utf-8")) if body else {}
 
+    @staticmethod
+    def _compact_execute_result(task_id, result: Any, exc: Exception | None = None) -> dict:
+        payload = {
+            "status": "failed",
+            "task_id": task_id,
+            "response_compacted": True,
+            "results": [],
+        }
+        if isinstance(result, dict):
+            payload["status"] = result.get("status") or payload["status"]
+            results = result.get("results")
+            if isinstance(results, list):
+                compact_results = []
+                for item in results:
+                    if isinstance(item, dict):
+                        compact_results.append(
+                            {
+                                "index": item.get("index"),
+                                "robot_id": item.get("robot_id"),
+                                "action": item.get("action"),
+                                "success": item.get("success"),
+                                "error": item.get("error"),
+                            }
+                        )
+                    else:
+                        compact_results.append({"success": False, "error": str(item)})
+                payload["results"] = compact_results
+        if exc is not None:
+            payload["response_warning"] = "full execute_actions response could not be serialized or sent"
+            payload["response_error_type"] = type(exc).__name__
+            payload["response_error"] = str(exc)
+        return payload
+
+    def _send_execute_result_json(self, status_code: int, task_id, result: dict) -> None:
+        try:
+            self._send_json(status_code, result)
+        except Exception as exc:
+            log_event("REMOTE OUT", f"POST /execute_actions response exception: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+            fallback = self._compact_execute_result(task_id, result, exc)
+            self._send_json(status_code, fallback)
+
     def _handle_execute(self):
         if not self._controller_ready():
             return
@@ -1521,19 +1563,35 @@ class NativeControllerReceiverHandler(BaseHTTPRequestHandler):
         log_event("REMOTE IN", f"POST /execute_actions task_id={task_id}, default_robot={default_robot_ref}, actions={len(actions)}, render_image={render_image}", blank_before=True)
         for action in actions:
             log_event("REMOTE IN", f"action {json.dumps(action, ensure_ascii=False)}")
-        result = thor_instance.execute_batch(actions, default_robot_ref=default_robot_ref, render_image=render_image, stop_on_failure=stop_on_failure)
-        result["task_id"] = task_id
-        n_ok = sum(1 for item in result["results"] if item.get("success"))
-        log_event("REMOTE OUT", f"POST /execute_actions status={result['status']} ({n_ok}/{len(result['results'])} ok)")
-        for item in result["results"]:
-            if not item.get("success"):
-                log_event(
-                    "REMOTE OUT",
-                    "failed action "
-                    f"index={item.get('index')} robot_id={item.get('robot_id')} "
-                    f"action={item.get('action')} error={item.get('error')}",
-                )
-        self._send_json(200, result)
+        try:
+            result = thor_instance.execute_batch(actions, default_robot_ref=default_robot_ref, render_image=render_image, stop_on_failure=stop_on_failure)
+            result["task_id"] = task_id
+            results = result.get("results", []) if isinstance(result, dict) else []
+            n_ok = sum(1 for item in results if isinstance(item, dict) and item.get("success"))
+            log_event("REMOTE OUT", f"POST /execute_actions status={result.get('status')} ({n_ok}/{len(results)} ok)")
+            for item in results:
+                if isinstance(item, dict) and not item.get("success"):
+                    log_event(
+                        "REMOTE OUT",
+                        "failed action "
+                        f"index={item.get('index')} robot_id={item.get('robot_id')} "
+                        f"action={item.get('action')} error={item.get('error')}",
+                    )
+        except Exception as exc:
+            log_event("REMOTE OUT", f"POST /execute_actions receiver exception: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+            self._send_json(
+                500,
+                {
+                    "status": "failed",
+                    "task_id": task_id,
+                    "error_code": "receiver_exception",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            return
+        self._send_execute_result_json(200, task_id, result)
 
     def _handle_goto(self):
         if not self._controller_ready():

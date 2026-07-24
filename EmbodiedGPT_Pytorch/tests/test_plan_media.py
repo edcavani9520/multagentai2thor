@@ -338,6 +338,39 @@ class TaskIntentToolTest(unittest.TestCase):
             ],
         )
 
+    def test_external_task_intent_json_bypasses_legacy_extraction(self) -> None:
+        payload = {
+            "task_intent_source": "qwen_normalizer_tool_call",
+            "task_intent": {
+                "requestedAction": "PickupObject",
+                "requestedObjectType": "Tomato",
+                "requestedTargetType": "CounterTop",
+                "intentSteps": [
+                    {"order": 1, "action": "PickupObject", "objectType": "Tomato", "targetType": None},
+                    {"order": 2, "action": "PutObject", "objectType": "Tomato", "targetType": "CounterTop"},
+                ],
+            },
+            "task_normalization": {"normalized_task": "pick up the Tomato and put it on the CounterTop."},
+        }
+        args = auto_scene_actions_module.parse_args(
+            ["--task", "pick up tomato and put it on counter", "--task-intent-json", json.dumps(payload)]
+        )
+        old_generate = auto_scene_actions_module.generate_task_intent_tool_call
+        auto_scene_actions_module.generate_task_intent_tool_call = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("external task intent must bypass legacy extraction")
+        )
+        try:
+            tool_call, intent, validation = auto_scene_actions_module.task_intent_from_args(args, ["Tomato", "CounterTop"])
+        finally:
+            auto_scene_actions_module.generate_task_intent_tool_call = old_generate
+
+        self.assertEqual(tool_call["name"], "external_task_intent")
+        self.assertEqual(validation["status"], "ok")
+        self.assertEqual(auto_scene_actions_module.task_intent_source_for_args(args), "qwen_normalizer_tool_call")
+        self.assertEqual(intent["requestedTargetType"], "CounterTop")
+        self.assertEqual(intent["intentSteps"][1]["action"], "PutObject")
+        self.assertEqual(getattr(args, "_task_normalization")["normalized_task"], "pick up the Tomato and put it on the CounterTop.")
+
     def test_local_tool_resolves_it_for_put_object(self) -> None:
         intent = execute_extract_task_intent_tool("Pick up the apple and put it on the counter.", ["Apple", "CounterTop"])
 

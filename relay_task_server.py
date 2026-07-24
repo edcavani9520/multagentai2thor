@@ -11,6 +11,8 @@ import sys
 import threading
 import traceback
 import uuid
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,9 +26,425 @@ SERVICE_REVISION = "2026-07-19-semantic-placeholder-v4"
 REPO_ROOT = Path(__file__).resolve().parent
 EMBODIED_ROOT = REPO_ROOT / "EmbodiedGPT_Pytorch"
 
+SUPPORTED_NORMALIZED_ACTIONS = {"GotoObject", "PickupObject", "PutObject", "OpenObject", "CloseObject", "Done"}
+TASK_NORMALIZER_TOOL_NAME = "normalize_incoming_task"
+TASK_NORMALIZER_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": TASK_NORMALIZER_TOOL_NAME,
+        "description": (
+            "Normalize an upstream planning subtask into one concise robot task and structured task intent "
+            "that the agents runtime can execute. Use only supported actions and choose object types from "
+            "the provided AI2-THOR object types."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "normalized_task": {"type": "string"},
+                "requestedAction": {"type": "string", "enum": sorted(SUPPORTED_NORMALIZED_ACTIONS)},
+                "requestedObjectType": {"type": ["string", "null"]},
+                "requestedTargetType": {"type": ["string", "null"]},
+                "intentSteps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "order": {"type": "integer"},
+                            "action": {"type": "string", "enum": sorted(SUPPORTED_NORMALIZED_ACTIONS)},
+                            "objectType": {"type": ["string", "null"]},
+                            "targetType": {"type": ["string", "null"]},
+                        },
+                        "required": ["order", "action", "objectType", "targetType"],
+                    },
+                },
+                "action": {"type": "string", "enum": sorted(SUPPORTED_NORMALIZED_ACTIONS)},
+                "object_type": {"type": ["string", "null"]},
+                "target_type": {"type": ["string", "null"]},
+                "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                "reason": {"type": "string"},
+            },
+            "required": [
+                "normalized_task",
+                "requestedAction",
+                "requestedObjectType",
+                "requestedTargetType",
+                "intentSteps",
+                "confidence",
+                "reason",
+            ],
+        },
+    },
+}
+
 
 def log(message: str) -> None:
     print(f"[RELAY TASK] {message}", flush=True)
+
+
+
+def _json_values_from_text(text: str) -> list[Any]:
+    decoder = json.JSONDecoder()
+    values: list[Any] = []
+    for index, char in enumerate(text):
+        if char not in "[{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        values.append(value)
+    return values
+
+
+def _tool_call_from_value(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, list):
+        for item in value:
+            tool_call = _tool_call_from_value(item)
+            if tool_call is not None:
+                return tool_call
+        return None
+    if not isinstance(value, dict):
+        return None
+    if isinstance(value.get("tool_calls"), list):
+        for item in value["tool_calls"]:
+            tool_call = _tool_call_from_value(item)
+            if tool_call is not None:
+                return tool_call
+    function_value = value.get("function")
+    if isinstance(function_value, dict):
+        name = function_value.get("name") or value.get("name")
+        arguments = function_value.get("arguments", value.get("arguments", {}))
+    else:
+        name = value.get("name") or value.get("tool_name")
+        arguments = value.get("arguments", value.get("parameters", {}))
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            arguments = {"raw": arguments}
+    if not isinstance(arguments, dict):
+        arguments = {}
+    return {"name": name.strip(), "arguments": arguments}
+
+
+def parse_task_normalizer_tool_call(output: str) -> dict[str, Any]:
+    for value in _json_values_from_text(output):
+        tool_call = _tool_call_from_value(value)
+        if tool_call is not None:
+            return tool_call
+    raise ValueError("Qwen output did not contain a valid task normalization tool call")
+
+
+def _object_type_from_object(item: Any) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    for key in ("objectType", "object_type", "type"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    object_id = item.get("objectId") or item.get("object_id")
+    if isinstance(object_id, str) and "|" in object_id:
+        head = object_id.split("|", 1)[0].strip()
+        return head or None
+    return None
+
+
+def extract_state_object_types(state: dict[str, Any]) -> list[str]:
+    object_types: list[str] = []
+    def add(value: str | None) -> None:
+        if value and value not in object_types:
+            object_types.append(value)
+    for item in state.get("objects") or []:
+        add(_object_type_from_object(item))
+    for robot in state.get("robots") or []:
+        if not isinstance(robot, dict):
+            continue
+        for key in ("visible_objects", "objects", "inventory"):
+            for item in robot.get(key) or []:
+                add(_object_type_from_object(item))
+    return sorted(object_types)
+
+
+def fetch_receiver_state_object_types(receiver_url: str, timeout: float) -> tuple[list[str], str | None]:
+    state_url = f"{receiver_url.rstrip('/')}/state"
+    try:
+        with urlopen(state_url, timeout=timeout) as response:
+            body = response.read().decode("utf-8", errors="replace")
+        parsed = json.loads(body)
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        return [], f"could not read receiver /state for task normalization: {type(exc).__name__}: {exc}"
+    if not isinstance(parsed, dict):
+        return [], "receiver /state did not return a JSON object"
+    return extract_state_object_types(parsed), None
+
+
+def task_normalizer_messages(task: str, object_types: list[str]) -> list[dict[str, Any]]:
+    supported = ", ".join(sorted(SUPPORTED_NORMALIZED_ACTIONS))
+    objects = ", ".join(object_types) if object_types else "(none)"
+    prompt = (
+        "You are the agents module boundary normalizer. Convert an upstream planning subtask into one concise "
+        "natural-language robot task and structured task_intent for the agents runtime.\n"
+        "Rules:\n"
+        "- Call normalize_incoming_task exactly once.\n"
+        "- Use only these actions: " + supported + ".\n"
+        "- requestedObjectType, requestedTargetType, objectType, and targetType must be null or exactly one of the current AI2-THOR object types.\n"
+        "- Fill intentSteps with every required high-level step in order. Multi-step tasks must not be collapsed.\n"
+        "- If the planning subtask is find/search/inspect a target object, normalize it as navigation to that object using GotoObject.\n"
+        "- Do not invent object types. If no suitable object type exists, use confidence low and keep the task close to the original.\n\n"
+        f"Current AI2-THOR object types: {objects}\n\n"
+        f"Incoming task: {task.strip()}"
+    )
+    return [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+
+
+
+def task_normalizer_json_messages(task: str, object_types: list[str]) -> list[dict[str, Any]]:
+    supported = ", ".join(sorted(SUPPORTED_NORMALIZED_ACTIONS))
+    objects = ", ".join(object_types) if object_types else "(none)"
+    prompt = (
+        "Normalize this upstream planning subtask into one concise robot task and structured task_intent for the agents runtime. "
+        "Return only one JSON object and no prose.\n"
+        "JSON keys: normalized_task, requestedAction, requestedObjectType, requestedTargetType, intentSteps, confidence, reason.\n"
+        f"Supported actions: {supported}.\n"
+        "Object fields must be null or exactly one of the current AI2-THOR object types.\n"
+        "intentSteps must contain every high-level step in order and use keys order, action, objectType, targetType.\n"
+        "If the planning subtask is find/search/inspect a target object, normalize it as navigation to that object using GotoObject.\n"
+        "Do not invent object types.\n\n"
+        f"Current AI2-THOR object types: {objects}\n\n"
+        f"Incoming task: {task.strip()}"
+    )
+    return [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+
+
+def generate_normalizer_json_fallback(backend: Any, task: str, object_types: list[str]) -> dict[str, Any] | None:
+    if not hasattr(backend, "generate_messages"):
+        return None
+    try:
+        try:
+            output = backend.generate_messages(task_normalizer_json_messages(task, object_types), deterministic=True)
+        except TypeError:
+            output = backend.generate_messages(task_normalizer_json_messages(task, object_types))
+    except Exception:
+        return None
+    for value in _json_values_from_text(str(output)):
+        if isinstance(value, dict) and any(key in value for key in ("normalized_task", "action", "object_type")):
+            return value
+    return None
+
+
+def _first_present(arguments: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in arguments:
+            return arguments.get(key)
+    return None
+
+
+def _normalize_confidence(value: Any) -> tuple[str, str | None]:
+    if isinstance(value, str):
+        confidence = value.strip().lower()
+        if confidence in {"high", "medium", "low"}:
+            return confidence, None
+        try:
+            value = float(confidence)
+        except ValueError:
+            return "low", f"normalizer returned invalid confidence {value!r}"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        score = float(value)
+        if score >= 0.75:
+            return "high", None
+        if score >= 0.4:
+            return "medium", None
+        return "low", None
+    return "low", f"normalizer returned invalid confidence {value!r}"
+
+
+def _canonical_task_from_normalized(action: Any, object_type: Any, target_type: Any) -> str | None:
+    if action == "Done":
+        return "done."
+    if not isinstance(object_type, str) or not object_type:
+        return None
+    if action == "GotoObject":
+        return f"go to the {object_type}."
+    if action == "PickupObject":
+        return f"pick up the {object_type}."
+    if action == "OpenObject":
+        return f"open the {object_type}."
+    if action == "CloseObject":
+        return f"close the {object_type}."
+    if action == "PutObject" and isinstance(target_type, str) and target_type:
+        return f"put the {object_type} on the {target_type}."
+    return None
+
+
+def _object_type_is_valid(value: Any, object_types: list[str]) -> bool:
+    return value is None or (isinstance(value, str) and value in set(object_types))
+
+
+def _normalize_intent_steps(arguments: dict[str, Any], action: Any, object_type: Any, target_type: Any, object_types: list[str]) -> tuple[list[dict[str, Any]], list[str]]:
+    warnings: list[str] = []
+    raw_steps = _first_present(arguments, "intentSteps", "intent_steps")
+    steps: list[dict[str, Any]] = []
+    if isinstance(raw_steps, list):
+        for index, raw_step in enumerate(raw_steps, start=1):
+            if not isinstance(raw_step, dict):
+                warnings.append(f"intentSteps[{index - 1}] must be an object")
+                continue
+            step_action = _first_present(raw_step, "action", "requestedAction")
+            step_object = _first_present(raw_step, "objectType", "object_type", "requestedObjectType")
+            step_target = _first_present(raw_step, "targetType", "target_type", "requestedTargetType")
+            order = raw_step.get("order", index)
+            if not isinstance(order, int) or isinstance(order, bool) or order <= 0:
+                warnings.append(f"intentSteps[{index - 1}] returned invalid order {order!r}; using {index}")
+                order = index
+            if step_action not in SUPPORTED_NORMALIZED_ACTIONS:
+                warnings.append(f"intentSteps[{index - 1}] returned unsupported action {step_action!r}")
+            for field, value in (("objectType", step_object), ("targetType", step_target)):
+                if not _object_type_is_valid(value, object_types):
+                    warnings.append(f"intentSteps[{index - 1}] returned {field} not present in receiver state: {value!r}")
+            steps.append({"order": order, "action": step_action, "objectType": step_object, "targetType": step_target})
+    elif raw_steps is not None:
+        warnings.append("intentSteps must be a list")
+
+    if not steps and action in SUPPORTED_NORMALIZED_ACTIONS:
+        steps.append({"order": 1, "action": action, "objectType": object_type, "targetType": target_type})
+    if not steps:
+        warnings.append("normalizer omitted usable intentSteps")
+    return steps, warnings
+
+
+def validate_task_normalization(arguments: dict[str, Any], object_types: list[str]) -> tuple[dict[str, Any], list[str]]:
+    warnings: list[str] = []
+    normalized_task = _first_present(arguments, "normalized_task", "normalizedTask", "task")
+    requested_action = _first_present(arguments, "requestedAction", "requested_action", "action")
+    requested_object = _first_present(arguments, "requestedObjectType", "requested_object_type", "object_type", "objectType")
+    requested_target = _first_present(arguments, "requestedTargetType", "requested_target_type", "target_type", "targetType")
+    confidence_value = arguments.get("confidence")
+    reason = arguments.get("reason")
+    if not isinstance(normalized_task, str) or not normalized_task.strip():
+        warnings.append("normalizer omitted non-empty normalized_task")
+        normalized_task = ""
+    if requested_action not in SUPPORTED_NORMALIZED_ACTIONS:
+        warnings.append(f"normalizer returned unsupported action {requested_action!r}")
+    confidence, confidence_warning = _normalize_confidence(confidence_value)
+    if confidence_warning:
+        warnings.append(confidence_warning)
+    for field, value in (("requestedObjectType", requested_object), ("requestedTargetType", requested_target)):
+        if not _object_type_is_valid(value, object_types):
+            warnings.append(f"normalizer returned {field} not present in receiver state: {value!r}")
+
+    steps, step_warnings = _normalize_intent_steps(arguments, requested_action, requested_object, requested_target, object_types)
+    warnings.extend(step_warnings)
+    primary_step = next((step for step in steps if step.get("action") in SUPPORTED_NORMALIZED_ACTIONS), None)
+    if primary_step is not None:
+        if requested_action not in SUPPORTED_NORMALIZED_ACTIONS:
+            requested_action = primary_step.get("action")
+        if requested_object is None:
+            requested_object = primary_step.get("objectType")
+        if requested_target is None:
+            requested_target = primary_step.get("targetType")
+
+    canonical_task = _canonical_task_from_normalized(requested_action, requested_object, requested_target)
+    if canonical_task and (not normalized_task or normalized_task.strip() == requested_action):
+        normalized_task = canonical_task
+    task_intent = {
+        "requestedAction": requested_action,
+        "requestedObjectType": requested_object,
+        "requestedTargetType": requested_target,
+        "intentSteps": steps,
+    }
+    normalized = {
+        "normalized_task": normalized_task.strip() if isinstance(normalized_task, str) else "",
+        "action": requested_action,
+        "object_type": requested_object,
+        "target_type": requested_target,
+        "requestedAction": requested_action,
+        "requestedObjectType": requested_object,
+        "requestedTargetType": requested_target,
+        "intentSteps": steps,
+        "task_intent": task_intent,
+        "confidence": confidence,
+        "reason": reason if isinstance(reason, str) else "",
+    }
+    return normalized, warnings
+
+def normalize_incoming_task_with_backend(backend: Any, task: str, object_types: list[str]) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "original_task": task,
+        "normalized_task": task,
+        "used": False,
+        "available_object_types": object_types,
+        "warnings": [],
+    }
+    if not hasattr(backend, "generate_with_tools"):
+        record["warnings"].append("backend does not support tool-based task normalization")
+        return record
+    try:
+        output = backend.generate_with_tools(task_normalizer_messages(task, object_types), [TASK_NORMALIZER_TOOL_SCHEMA])
+        tool_call = parse_task_normalizer_tool_call(str(output).strip())
+    except Exception as exc:
+        record["warnings"].append(f"task normalization failed: {type(exc).__name__}: {exc}")
+        return record
+    if tool_call.get("name") != TASK_NORMALIZER_TOOL_NAME:
+        record["warnings"].append(f"normalizer called unexpected tool {tool_call.get('name')!r}")
+        return record
+    arguments = tool_call.get("arguments") if isinstance(tool_call.get("arguments"), dict) else {}
+    normalized, warnings = validate_task_normalization(arguments, object_types)
+    source = "qwen_tool_call"
+    if warnings:
+        fallback_arguments = generate_normalizer_json_fallback(backend, task, object_types)
+        if fallback_arguments is not None:
+            fallback_normalized, fallback_warnings = validate_task_normalization(fallback_arguments, object_types)
+            if not fallback_warnings:
+                normalized, warnings = fallback_normalized, []
+                source = "qwen_json_fallback"
+            else:
+                warnings.extend(f"json fallback: {warning}" for warning in fallback_warnings)
+        else:
+            warnings.append("json fallback was unavailable or did not return a valid JSON object")
+    record.update(normalized)
+    record["source"] = source
+    record["warnings"].extend(warnings)
+    if not warnings and normalized.get("confidence") in {"high", "medium"}:
+        record["normalized_task"] = normalized["normalized_task"]
+        record["used"] = normalized["normalized_task"] != task
+    else:
+        record["candidate_normalized_task"] = normalized.get("normalized_task") or ""
+        record["normalized_task"] = task
+        record["used"] = False
+    return record
+
+
+def missing_model_shards(model_path: str) -> list[str]:
+    path = Path(model_path).expanduser()
+    if not path.is_dir():
+        return []
+    index_path = path / "model.safetensors.index.json"
+    if not index_path.exists():
+        return []
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict):
+        return []
+    missing = []
+    for shard in sorted({str(value) for value in weight_map.values() if isinstance(value, str)}):
+        if not (path / shard).exists():
+            missing.append(shard)
+    return missing
+
+
+def model_shard_error(model_path: str) -> str | None:
+    missing = missing_model_shards(model_path)
+    if not missing:
+        return None
+    return (
+        f"model path {model_path!r} is incomplete; missing safetensors shard(s): {', '.join(missing)}. "
+        "Use a complete Qwen3.5-4B directory, e.g. /225010231/mwl/Linhao/models/Qwen3.5-4B."
+    )
 
 
 def _last_json_object(text: str) -> dict[str, Any]:
@@ -118,6 +536,31 @@ class RelayTaskService:
             raise ValueError("missing non-empty task (or instruction/prompt)")
 
         task_id = str(payload.get("task_id") or uuid.uuid4())
+        if hasattr(self.backend, "generate_with_tools"):
+            state_object_types, state_warning = fetch_receiver_state_object_types(
+                self.config.receiver_url,
+                self.config.send_timeout,
+            )
+        else:
+            state_object_types, state_warning = [], None
+        task_normalization = normalize_incoming_task_with_backend(self.backend, task.strip(), state_object_types)
+        if state_warning:
+            task_normalization.setdefault("warnings", []).append(state_warning)
+        executable_task = str(task_normalization.get("normalized_task") or task).strip()
+        task_intent_json = None
+        if (
+            isinstance(task_normalization.get("task_intent"), dict)
+            and not task_normalization.get("warnings")
+            and task_normalization.get("confidence") in {"high", "medium"}
+        ):
+            task_intent_json = json.dumps(
+                {
+                    "task_intent": task_normalization["task_intent"],
+                    "task_intent_source": "qwen_normalizer_tool_call",
+                    "task_normalization": task_normalization,
+                },
+                ensure_ascii=False,
+            )
         primary_robot_id = payload.get("primary_robot_id", payload.get("robot_id", 0))
         if not isinstance(primary_robot_id, int) or isinstance(primary_robot_id, bool) or primary_robot_id < 0:
             raise ValueError("primary_robot_id must be a non-negative integer")
@@ -138,7 +581,7 @@ class RelayTaskService:
         execute_actions_url = f"{self.config.receiver_url.rstrip('/')}/execute_actions"
         argv = [
             "--execute-actions-url", execute_actions_url,
-            "--task", task.strip(),
+            "--task", executable_task,
             "--task-id", task_id,
             "--output-dir", str(self.config.output_dir),
             "--send-timeout", str(self.config.send_timeout),
@@ -159,6 +602,8 @@ class RelayTaskService:
         ]
         if known_robot_ids is not None:
             argv.extend(["--known-robot-ids", ",".join(str(robot_id) for robot_id in known_robot_ids)])
+        if task_intent_json is not None:
+            argv.extend(["--task-intent-json", task_intent_json])
         if dry_run:
             argv.append("--dry-run")
 
@@ -186,6 +631,7 @@ class RelayTaskService:
             "task_id": task_id,
             "dry_run": dry_run,
             "result": result,
+            "task_normalization": task_normalization,
         }
         if runtime_stderr:
             response["runtime_log"] = runtime_stderr
@@ -284,6 +730,9 @@ def main() -> None:
         parser.error("invalid relay/action limits")
     if not EMBODIED_ROOT.is_dir():
         parser.error(f"EmbodiedGPT runtime is missing: {EMBODIED_ROOT}")
+    shard_error = model_shard_error(args.model_path)
+    if shard_error is not None:
+        parser.error(shard_error)
 
     sys.path.insert(0, str(EMBODIED_ROOT))
     from demo import auto_scene_actions

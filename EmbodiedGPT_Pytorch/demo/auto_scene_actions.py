@@ -173,6 +173,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--execute-actions-url", default=DEFAULT_EXECUTE_ACTIONS_URL)
     parser.add_argument("--task", default="Infer a useful embodied task from the visible scene.")
+    parser.add_argument("--task-intent-json", help="Structured task intent JSON supplied by an upstream normalizer.")
     parser.add_argument("--task-id", help="Task id for the final payload. Defaults to a generated id.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--send-timeout", type=positive_float, default=DEFAULT_HTTP_TIMEOUT)
@@ -1508,6 +1509,92 @@ def generate_task_intent_tool_call(
     tool_call_validation = validate_task_intent_tool_call(tool_call, args.task)
     task_intent = execute_extract_task_intent_tool(args.task, available_types)
     return tool_call, task_intent, tool_call_validation
+
+def task_intent_source_for_args(args: argparse.Namespace) -> str:
+    source = getattr(args, "_task_intent_source", None)
+    return source if isinstance(source, str) and source else TASK_INTENT_SOURCE
+
+
+def _normalize_external_intent_step(step: dict[str, Any], index: int) -> dict[str, Any]:
+    order = step.get("order", index)
+    if not isinstance(order, int) or isinstance(order, bool) or order <= 0:
+        order = index
+    return {
+        "order": order,
+        "action": step.get("action"),
+        "objectType": step.get("objectType", step.get("object_type")),
+        "targetType": step.get("targetType", step.get("target_type")),
+    }
+
+
+def parse_external_task_intent_json(value: str, original_task: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str, dict[str, Any] | None]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"--task-intent-json must be a JSON object: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("--task-intent-json must be a JSON object")
+
+    raw_intent = parsed.get("task_intent") if isinstance(parsed.get("task_intent"), dict) else parsed
+    if not isinstance(raw_intent, dict):
+        raise RuntimeError("--task-intent-json must contain a task_intent object")
+
+    raw_steps = raw_intent.get("intentSteps")
+    steps = []
+    if isinstance(raw_steps, list):
+        steps = [_normalize_external_intent_step(step, index) for index, step in enumerate(raw_steps, start=1) if isinstance(step, dict)]
+    if not steps and raw_intent.get("requestedAction") is not None:
+        steps = [
+            {
+                "order": 1,
+                "action": raw_intent.get("requestedAction"),
+                "objectType": raw_intent.get("requestedObjectType"),
+                "targetType": raw_intent.get("requestedTargetType", raw_intent.get("targetType")),
+            }
+        ]
+    if not steps:
+        raise RuntimeError("--task-intent-json did not include usable intentSteps")
+
+    primary_step = primary_intent_step(steps) or steps[0]
+    requested_action = raw_intent.get("requestedAction", primary_step.get("action"))
+    requested_object = raw_intent.get("requestedObjectType", primary_step.get("objectType"))
+    requested_target = raw_intent.get("requestedTargetType", raw_intent.get("targetType", primary_step.get("targetType")))
+    task_intent = {
+        "requestedAction": requested_action,
+        "requestedObjectType": requested_object,
+        "requestedTargetType": requested_target,
+        "intentSteps": steps,
+    }
+    tool_call = {
+        "name": "external_task_intent",
+        "arguments": {
+            "task": original_task,
+            "requestedAction": requested_action,
+            "requestedObjectType": requested_object,
+            "requestedTargetType": requested_target,
+            "intentSteps": steps,
+        },
+    }
+    validation = {"status": "ok", "warnings": []}
+    source = parsed.get("task_intent_source")
+    if not isinstance(source, str) or not source:
+        source = "external_task_intent"
+    metadata = parsed.get("task_normalization") if isinstance(parsed.get("task_normalization"), dict) else None
+    return tool_call, task_intent, validation, source, metadata
+
+
+def task_intent_from_args(
+    args: argparse.Namespace,
+    available_types: list[str],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    if getattr(args, "task_intent_json", None):
+        tool_call, task_intent, validation, source, metadata = parse_external_task_intent_json(args.task_intent_json, args.task)
+        setattr(args, "_task_intent_source", source)
+        if metadata is not None:
+            setattr(args, "_task_normalization", metadata)
+        return tool_call, task_intent, validation
+    setattr(args, "_task_intent_source", TASK_INTENT_SOURCE)
+    return generate_task_intent_tool_call(args, available_types)
 
 
 def semantic_normalization_warnings(semantic_plan: dict[str, Any]) -> list[str]:
@@ -4344,7 +4431,7 @@ def run_closed_loop_replan(
             "intent_steps": steps,
             "task_intent_tool_call": task_intent_tool_call,
             "task_intent_tool_call_validation": task_intent_tool_call_validation,
-            "task_intent_source": TASK_INTENT_SOURCE,
+            "task_intent_source": task_intent_source_for_args(args),
             "closed_loop_result": closed_loop_failure_result(
                 f"intent has {len(steps)} steps, exceeding --max-replan-steps {args.max_replan_steps}",
                 failed_step_index=args.max_replan_steps + 1,
@@ -4370,7 +4457,7 @@ def run_closed_loop_replan(
         "intent_steps": steps,
         "task_intent_tool_call": task_intent_tool_call,
         "task_intent_tool_call_validation": task_intent_tool_call_validation,
-        "task_intent_source": TASK_INTENT_SOURCE,
+        "task_intent_source": task_intent_source_for_args(args),
         "closed_loop_trace": [],
         "step_payloads": [],
         "step_execute_response_summaries": [],
@@ -4757,8 +4844,11 @@ def run(args: argparse.Namespace) -> int:
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0
 
-        print("Generating task intent tool call with Qwen...", file=sys.stderr)
-        task_intent_tool_call, task_intent, task_intent_tool_call_validation = generate_task_intent_tool_call(
+        if getattr(args, "task_intent_json", None):
+            print("Using upstream task intent JSON...", file=sys.stderr)
+        else:
+            print("Generating task intent tool call with Qwen...", file=sys.stderr)
+        task_intent_tool_call, task_intent, task_intent_tool_call_validation = task_intent_from_args(
             args,
             object_categories(objects, visible_only=False),
         )
@@ -4811,7 +4901,7 @@ def run(args: argparse.Namespace) -> int:
                 "task_intent": task_intent,
                 "task_intent_tool_call": task_intent_tool_call,
                 "task_intent_tool_call_validation": task_intent_tool_call_validation,
-                "task_intent_source": TASK_INTENT_SOURCE,
+                "task_intent_source": task_intent_source_for_args(args),
             }
             semantic_warnings = semantic_normalization_warnings(primary_semantic_plan)
             if semantic_warnings:
@@ -4901,7 +4991,7 @@ def run(args: argparse.Namespace) -> int:
             "task_intent": task_intent,
             "task_intent_tool_call": task_intent_tool_call,
             "task_intent_tool_call_validation": task_intent_tool_call_validation,
-            "task_intent_source": TASK_INTENT_SOURCE,
+            "task_intent_source": task_intent_source_for_args(args),
         }
         if intent_expansion_warnings:
             result["intent_expansion_warnings"] = intent_expansion_warnings

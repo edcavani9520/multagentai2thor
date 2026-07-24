@@ -661,6 +661,125 @@ class NavigationReceiverMethodTest(unittest.TestCase):
         self.assertEqual(sent, [(200, {"status": "success", "actions": [{"action": "MoveAhead"}]})])
         self.assertEqual(fake.payload, {"task_id": "goto-1", "execute": False})
 
+    def test_handler_execute_dispatches_to_thor_instance(self) -> None:
+        class FakeThor:
+            controller = object()
+
+            def execute_batch(self, actions, default_robot_ref=None, render_image=False, stop_on_failure=True):
+                self.call = {
+                    "actions": actions,
+                    "default_robot_ref": default_robot_ref,
+                    "render_image": render_image,
+                    "stop_on_failure": stop_on_failure,
+                }
+                return {"status": "success", "results": [{"index": 0, "robot_id": 0, "action": "Pass", "success": True}]}
+
+        fake = FakeThor()
+        original = module.thor_instance
+        module.thor_instance = fake
+        try:
+            handler = NativeControllerReceiverHandler.__new__(NativeControllerReceiverHandler)
+            handler._controller_ready = MethodType(lambda self: True, handler)
+            handler._read_json = MethodType(
+                lambda self: {
+                    "task_id": "exec-1",
+                    "robot_id": 0,
+                    "stop_on_failure": False,
+                    "actions": [{"action": "Pass"}],
+                },
+                handler,
+            )
+            sent = []
+            handler._send_json = MethodType(lambda self, code, payload: sent.append((code, payload)), handler)
+
+            handler._handle_execute()
+        finally:
+            module.thor_instance = original
+
+        self.assertEqual(fake.call["default_robot_ref"], 0)
+        self.assertFalse(fake.call["stop_on_failure"])
+        self.assertEqual(sent[0][0], 200)
+        self.assertEqual(sent[0][1]["status"], "success")
+        self.assertEqual(sent[0][1]["task_id"], "exec-1")
+
+    def test_handler_execute_returns_json_for_receiver_exception(self) -> None:
+        class FakeThor:
+            controller = object()
+
+            def execute_batch(self, actions, default_robot_ref=None, render_image=False, stop_on_failure=True):
+                raise RuntimeError("controller pipe closed")
+
+        fake = FakeThor()
+        original = module.thor_instance
+        module.thor_instance = fake
+        try:
+            handler = NativeControllerReceiverHandler.__new__(NativeControllerReceiverHandler)
+            handler._controller_ready = MethodType(lambda self: True, handler)
+            handler._read_json = MethodType(lambda self: {"task_id": "exec-err", "actions": [{"action": "OpenObject"}]}, handler)
+            sent = []
+            handler._send_json = MethodType(lambda self, code, payload: sent.append((code, payload)), handler)
+
+            handler._handle_execute()
+        finally:
+            module.thor_instance = original
+
+        self.assertEqual(sent[0][0], 500)
+        self.assertEqual(sent[0][1]["status"], "failed")
+        self.assertEqual(sent[0][1]["task_id"], "exec-err")
+        self.assertEqual(sent[0][1]["error_code"], "receiver_exception")
+        self.assertEqual(sent[0][1]["error_type"], "RuntimeError")
+        self.assertIn("controller pipe closed", sent[0][1]["error"])
+
+    def test_handler_execute_compacts_response_when_full_send_fails(self) -> None:
+        class FakeThor:
+            controller = object()
+
+            def execute_batch(self, actions, default_robot_ref=None, render_image=False, stop_on_failure=True):
+                return {
+                    "status": "success",
+                    "results": [
+                        {
+                            "index": 0,
+                            "robot_id": 0,
+                            "action": "PickupObject",
+                            "success": True,
+                            "error": None,
+                            "non_serializable": object(),
+                        }
+                    ],
+                    "state": {"large": object()},
+                }
+
+        fake = FakeThor()
+        original = module.thor_instance
+        module.thor_instance = fake
+        try:
+            handler = NativeControllerReceiverHandler.__new__(NativeControllerReceiverHandler)
+            handler._controller_ready = MethodType(lambda self: True, handler)
+            handler._read_json = MethodType(lambda self: {"task_id": "exec-compact", "actions": [{"action": "PickupObject"}]}, handler)
+            sent = []
+
+            def send_json(self, code, payload):
+                if not sent:
+                    sent.append((code, payload, "full"))
+                    raise TypeError("not JSON serializable")
+                sent.append((code, payload, "compact"))
+
+            handler._send_json = MethodType(send_json, handler)
+
+            handler._handle_execute()
+        finally:
+            module.thor_instance = original
+
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[1][0], 200)
+        fallback = sent[1][1]
+        self.assertTrue(fallback["response_compacted"])
+        self.assertEqual(fallback["task_id"], "exec-compact")
+        self.assertEqual(fallback["status"], "success")
+        self.assertEqual(fallback["results"], [{"index": 0, "robot_id": 0, "action": "PickupObject", "success": True, "error": None}])
+        self.assertEqual(fallback["response_error_type"], "TypeError")
+
     def test_handler_goto_returns_json_for_receiver_exception(self) -> None:
         class FakeThor:
             controller = object()
