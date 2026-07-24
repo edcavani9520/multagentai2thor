@@ -40,20 +40,21 @@ class FakeNormalizerBackend:
 
 
 class EmptyToolThenJsonBackend:
+    def __init__(self, fallback_arguments=None):
+        self.fallback_arguments = fallback_arguments or {
+            "normalized_task": "go to the Fridge.",
+            "intentSteps": [
+                {"order": 1, "action": "GotoObject", "objectType": "Fridge", "targetType": None},
+            ],
+            "confidence": "high",
+            "reason": "fallback normalized search to navigation",
+        }
+
     def generate_with_tools(self, messages, tools):
         return json.dumps({"name": "normalize_incoming_task", "arguments": {}})
 
     def generate_messages(self, messages, deterministic=False):
-        return json.dumps(
-            {
-                "normalized_task": "go to the Fridge.",
-                "action": "GotoObject",
-                "object_type": "Fridge",
-                "target_type": None,
-                "confidence": "high",
-                "reason": "fallback normalized search to navigation",
-            }
-        )
+        return json.dumps(self.fallback_arguments)
 
 
 def service_config(temp_dir: str | Path = "/tmp") -> RelayRuntimeConfig:
@@ -125,9 +126,9 @@ class RelayTaskServiceTest(unittest.TestCase):
                 backend = FakeNormalizerBackend(
                     {
                         "normalized_task": "go to the Fridge.",
-                        "action": "GotoObject",
-                        "object_type": "Fridge",
-                        "target_type": None,
+                        "intentSteps": [
+                            {"order": 1, "action": "GotoObject", "objectType": "Fridge", "targetType": None},
+                        ],
                         "confidence": "high",
                         "reason": "planning requested finding a fridge; execute as navigation",
                     }
@@ -213,6 +214,77 @@ class RelayTaskServiceTest(unittest.TestCase):
         self.assertEqual(engine.argv[task_index], "go to the Fridge.")
         self.assertTrue(response["task_normalization"]["used"])
         self.assertEqual(response["task_normalization"]["source"], "qwen_json_fallback")
+        self.assertIn("raw_tool_output_preview", response["task_normalization"])
+        self.assertIn("raw_json_fallback_preview", response["task_normalization"])
+        intent_index = engine.argv.index("--task-intent-json") + 1
+        task_intent = json.loads(engine.argv[intent_index])["task_intent"]
+        self.assertEqual(task_intent["requestedAction"], "GotoObject")
+        self.assertEqual(task_intent["requestedObjectType"], "Fridge")
+
+    def test_normalizer_json_fallback_extracts_multi_step_open_close(self):
+        old_fetch = relay_task_server.fetch_receiver_state_object_types
+        relay_task_server.fetch_receiver_state_object_types = lambda receiver_url, timeout: (["Fridge"], None)
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                engine = FakeEngine()
+                service = RelayTaskService(
+                    engine,
+                    EmptyToolThenJsonBackend(
+                        {
+                            "normalized_task": "open the Fridge and close the Fridge.",
+                            "intentSteps": [
+                                {"order": 1, "action": "OpenObject", "objectType": "Fridge", "targetType": None},
+                                {"order": 2, "action": "CloseObject", "objectType": "Fridge", "targetType": None},
+                            ],
+                            "confidence": "high",
+                            "reason": "the task requests opening then closing the same object",
+                        }
+                    ),
+                    service_config(temp_dir),
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    response = service.execute_task({"task_id": "open-close", "task": "open the fridge and close the fridge"})
+        finally:
+            relay_task_server.fetch_receiver_state_object_types = old_fetch
+
+        intent_index = engine.argv.index("--task-intent-json") + 1
+        task_intent = json.loads(engine.argv[intent_index])["task_intent"]
+        self.assertEqual(response["task_normalization"]["source"], "qwen_json_fallback")
+        self.assertEqual(task_intent["requestedAction"], "OpenObject")
+        self.assertEqual(task_intent["intentSteps"][1]["action"], "CloseObject")
+
+    def test_normalizer_json_fallback_extracts_multi_step_pickup_put(self):
+        old_fetch = relay_task_server.fetch_receiver_state_object_types
+        relay_task_server.fetch_receiver_state_object_types = lambda receiver_url, timeout: (["Tomato", "CounterTop"], None)
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                engine = FakeEngine()
+                service = RelayTaskService(
+                    engine,
+                    EmptyToolThenJsonBackend(
+                        {
+                            "normalized_task": "pick up the Tomato and put it on the CounterTop.",
+                            "intentSteps": [
+                                {"order": 1, "action": "PickupObject", "objectType": "Tomato", "targetType": None},
+                                {"order": 2, "action": "PutObject", "objectType": "Tomato", "targetType": "CounterTop"},
+                            ],
+                            "confidence": "high",
+                            "reason": "the task requests pickup followed by placement",
+                        }
+                    ),
+                    service_config(temp_dir),
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    response = service.execute_task({"task_id": "pickup-put", "task": "pick up the tomato and put it on the counter"})
+        finally:
+            relay_task_server.fetch_receiver_state_object_types = old_fetch
+
+        intent_index = engine.argv.index("--task-intent-json") + 1
+        task_intent = json.loads(engine.argv[intent_index])["task_intent"]
+        self.assertEqual(response["task_normalization"]["source"], "qwen_json_fallback")
+        self.assertEqual(task_intent["requestedTargetType"], "CounterTop")
+        self.assertEqual(task_intent["intentSteps"][0]["action"], "PickupObject")
+        self.assertEqual(task_intent["intentSteps"][1]["action"], "PutObject")
 
     def test_normalizer_canonicalizes_action_only_task_text(self):
         old_fetch = relay_task_server.fetch_receiver_state_object_types

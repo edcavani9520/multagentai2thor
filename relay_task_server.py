@@ -33,17 +33,14 @@ TASK_NORMALIZER_TOOL_SCHEMA = {
     "function": {
         "name": TASK_NORMALIZER_TOOL_NAME,
         "description": (
-            "Normalize an upstream planning subtask into one concise robot task and structured task intent "
-            "that the agents runtime can execute. Use only supported actions and choose object types from "
-            "the provided AI2-THOR object types."
+            "Normalize an upstream planning subtask into one concise robot task and ordered intent steps "
+            "that the agents runtime can execute. Use only supported actions and object types from the "
+            "provided AI2-THOR object types."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "normalized_task": {"type": "string"},
-                "requestedAction": {"type": "string", "enum": sorted(SUPPORTED_NORMALIZED_ACTIONS)},
-                "requestedObjectType": {"type": ["string", "null"]},
-                "requestedTargetType": {"type": ["string", "null"]},
                 "intentSteps": {
                     "type": "array",
                     "items": {
@@ -57,21 +54,10 @@ TASK_NORMALIZER_TOOL_SCHEMA = {
                         "required": ["order", "action", "objectType", "targetType"],
                     },
                 },
-                "action": {"type": "string", "enum": sorted(SUPPORTED_NORMALIZED_ACTIONS)},
-                "object_type": {"type": ["string", "null"]},
-                "target_type": {"type": ["string", "null"]},
                 "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
                 "reason": {"type": "string"},
             },
-            "required": [
-                "normalized_task",
-                "requestedAction",
-                "requestedObjectType",
-                "requestedTargetType",
-                "intentSteps",
-                "confidence",
-                "reason",
-            ],
+            "required": ["normalized_task", "intentSteps", "confidence", "reason"],
         },
     },
 }
@@ -185,11 +171,12 @@ def task_normalizer_messages(task: str, object_types: list[str]) -> list[dict[st
     objects = ", ".join(object_types) if object_types else "(none)"
     prompt = (
         "You are the agents module boundary normalizer. Convert an upstream planning subtask into one concise "
-        "natural-language robot task and structured task_intent for the agents runtime.\n"
+        "natural-language robot task and ordered intent steps for the agents runtime.\n"
         "Rules:\n"
         "- Call normalize_incoming_task exactly once.\n"
+        "- Fill only normalized_task, intentSteps, confidence, and reason.\n"
         "- Use only these actions: " + supported + ".\n"
-        "- requestedObjectType, requestedTargetType, objectType, and targetType must be null or exactly one of the current AI2-THOR object types.\n"
+        "- objectType and targetType must be null or exactly one of the current AI2-THOR object types.\n"
         "- Fill intentSteps with every required high-level step in order. Multi-step tasks must not be collapsed.\n"
         "- If the planning subtask is find/search/inspect a target object, normalize it as navigation to that object using GotoObject.\n"
         "- Do not invent object types. If no suitable object type exists, use confidence low and keep the task close to the original.\n\n"
@@ -204,35 +191,60 @@ def task_normalizer_json_messages(task: str, object_types: list[str]) -> list[di
     supported = ", ".join(sorted(SUPPORTED_NORMALIZED_ACTIONS))
     objects = ", ".join(object_types) if object_types else "(none)"
     prompt = (
-        "Normalize this upstream planning subtask into one concise robot task and structured task_intent for the agents runtime. "
+        "Normalize this upstream planning subtask into one concise robot task and ordered intent steps for the agents runtime. "
         "Return only one JSON object and no prose.\n"
-        "JSON keys: normalized_task, requestedAction, requestedObjectType, requestedTargetType, intentSteps, confidence, reason.\n"
+        "Required JSON keys: normalized_task, intentSteps, confidence, reason.\n"
         f"Supported actions: {supported}.\n"
-        "Object fields must be null or exactly one of the current AI2-THOR object types.\n"
+        "objectType and targetType must be null or exactly one of the current AI2-THOR object types.\n"
         "intentSteps must contain every high-level step in order and use keys order, action, objectType, targetType.\n"
         "If the planning subtask is find/search/inspect a target object, normalize it as navigation to that object using GotoObject.\n"
         "Do not invent object types.\n\n"
+        "Example input: open the fridge and close the fridge.\n"
+        "Example JSON: {\"normalized_task\":\"open the Fridge and close the Fridge.\",\"intentSteps\":[{\"order\":1,\"action\":\"OpenObject\",\"objectType\":\"Fridge\",\"targetType\":null},{\"order\":2,\"action\":\"CloseObject\",\"objectType\":\"Fridge\",\"targetType\":null}],\"confidence\":\"high\",\"reason\":\"the task requests opening then closing the same object\"}\n"
+        "Example input: pick up the tomato and put it on the counter.\n"
+        "Example JSON: {\"normalized_task\":\"pick up the Tomato and put it on the CounterTop.\",\"intentSteps\":[{\"order\":1,\"action\":\"PickupObject\",\"objectType\":\"Tomato\",\"targetType\":null},{\"order\":2,\"action\":\"PutObject\",\"objectType\":\"Tomato\",\"targetType\":\"CounterTop\"}],\"confidence\":\"high\",\"reason\":\"the task requests pickup followed by placement\"}\n\n"
         f"Current AI2-THOR object types: {objects}\n\n"
         f"Incoming task: {task.strip()}"
     )
     return [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
 
+def _preview_text(value: Any, limit: int = 1000) -> str:
+    text = str(value).strip()
+    return text if len(text) <= limit else text[:limit] + "..."
 
-def generate_normalizer_json_fallback(backend: Any, task: str, object_types: list[str]) -> dict[str, Any] | None:
+
+def _looks_like_normalizer_arguments(value: dict[str, Any]) -> bool:
+    return any(
+        key in value
+        for key in (
+            "normalized_task",
+            "normalizedTask",
+            "intentSteps",
+            "intent_steps",
+            "requestedAction",
+            "requestedObjectType",
+            "action",
+            "object_type",
+            "objectType",
+        )
+    )
+
+
+def generate_normalizer_json_fallback(backend: Any, task: str, object_types: list[str]) -> tuple[dict[str, Any] | None, str | None]:
     if not hasattr(backend, "generate_messages"):
-        return None
+        return None, None
     try:
         try:
             output = backend.generate_messages(task_normalizer_json_messages(task, object_types), deterministic=True)
         except TypeError:
             output = backend.generate_messages(task_normalizer_json_messages(task, object_types))
-    except Exception:
-        return None
-    for value in _json_values_from_text(str(output)):
-        if isinstance(value, dict) and any(key in value for key in ("normalized_task", "action", "object_type")):
-            return value
-    return None
-
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    output_text = str(output)
+    for value in _json_values_from_text(output_text):
+        if isinstance(value, dict) and _looks_like_normalizer_arguments(value):
+            return value, _preview_text(output_text)
+    return None, _preview_text(output_text)
 
 def _first_present(arguments: dict[str, Any], *keys: str) -> Any:
     for key in keys:
@@ -325,18 +337,14 @@ def validate_task_normalization(arguments: dict[str, Any], object_types: list[st
     if not isinstance(normalized_task, str) or not normalized_task.strip():
         warnings.append("normalizer omitted non-empty normalized_task")
         normalized_task = ""
-    if requested_action not in SUPPORTED_NORMALIZED_ACTIONS:
-        warnings.append(f"normalizer returned unsupported action {requested_action!r}")
     confidence, confidence_warning = _normalize_confidence(confidence_value)
     if confidence_warning:
         warnings.append(confidence_warning)
-    for field, value in (("requestedObjectType", requested_object), ("requestedTargetType", requested_target)):
-        if not _object_type_is_valid(value, object_types):
-            warnings.append(f"normalizer returned {field} not present in receiver state: {value!r}")
 
     steps, step_warnings = _normalize_intent_steps(arguments, requested_action, requested_object, requested_target, object_types)
     warnings.extend(step_warnings)
     primary_step = next((step for step in steps if step.get("action") in SUPPORTED_NORMALIZED_ACTIONS), None)
+    target_step = next((step for step in steps if step.get("targetType") is not None), None)
     if primary_step is not None:
         if requested_action not in SUPPORTED_NORMALIZED_ACTIONS:
             requested_action = primary_step.get("action")
@@ -344,6 +352,13 @@ def validate_task_normalization(arguments: dict[str, Any], object_types: list[st
             requested_object = primary_step.get("objectType")
         if requested_target is None:
             requested_target = primary_step.get("targetType")
+    if requested_target is None and target_step is not None:
+        requested_target = target_step.get("targetType")
+    if requested_action not in SUPPORTED_NORMALIZED_ACTIONS:
+        warnings.append(f"normalizer returned unsupported action {requested_action!r}")
+    for field, value in (("requestedObjectType", requested_object), ("requestedTargetType", requested_target)):
+        if not _object_type_is_valid(value, object_types):
+            warnings.append(f"normalizer returned {field} not present in receiver state: {value!r}")
 
     canonical_task = _canonical_task_from_normalized(requested_action, requested_object, requested_target)
     if canonical_task and (not normalized_task or normalized_task.strip() == requested_action):
@@ -382,6 +397,7 @@ def normalize_incoming_task_with_backend(backend: Any, task: str, object_types: 
         return record
     try:
         output = backend.generate_with_tools(task_normalizer_messages(task, object_types), [TASK_NORMALIZER_TOOL_SCHEMA])
+        record["raw_tool_output_preview"] = _preview_text(output)
         tool_call = parse_task_normalizer_tool_call(str(output).strip())
     except Exception as exc:
         record["warnings"].append(f"task normalization failed: {type(exc).__name__}: {exc}")
@@ -393,7 +409,9 @@ def normalize_incoming_task_with_backend(backend: Any, task: str, object_types: 
     normalized, warnings = validate_task_normalization(arguments, object_types)
     source = "qwen_tool_call"
     if warnings:
-        fallback_arguments = generate_normalizer_json_fallback(backend, task, object_types)
+        fallback_arguments, fallback_preview = generate_normalizer_json_fallback(backend, task, object_types)
+        if fallback_preview:
+            record["raw_json_fallback_preview"] = fallback_preview
         if fallback_arguments is not None:
             fallback_normalized, fallback_warnings = validate_task_normalization(fallback_arguments, object_types)
             if not fallback_warnings:
